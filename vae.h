@@ -3,6 +3,7 @@
 // Architecture: conv1(64->2048,k=7) -> 5xblock(snake+convT+3xresunit) -> snake+conv2(128->2,k=7)
 // ResUnit(ch, dil): skip=x -> snake->conv(k=7,dil)->snake->conv(k=1)->+skip
 // Snake: x + sin^2(e^a * x) * (1/e^b)
+// ConvT: mul_mat(W_perm, transpose(x)) -> col2im_1d (replaces naive conv_transpose_1d)
 // Weight norm fused at load: w = g*v/||v||
 // Upsample: 10x6x4x4x2 = 1920x
 
@@ -28,7 +29,7 @@ struct VAEResUnit {
 
 struct VAEBlock {
     struct ggml_tensor * sa, * sb;     // snake exp(a/b) [1, in_ch]
-    struct ggml_tensor * ctw, * ctb;   // conv_transpose fused [K, out_ch, in_ch], bias [out_ch]
+    struct ggml_tensor * ctw, * ctb;   // conv_transpose [IC, K*OC] pre-permuted, bias [out_ch]
     int in_ch, out_ch, stride, kernel;
     VAEResUnit ru[3];
 };
@@ -59,8 +60,7 @@ struct VAEGGML {
 
 // Load helpers
 // Fuse weight_norm: w = g*v/||v||, write f32 into pre-allocated ggml_tensor
-// Works for both Conv1d [OC,IC,K] and ConvTranspose1d [IC,OC,K]:
-// weight_norm normalizes over dim=0 (shape[0]), regardless of semantics.
+// Works for Conv1d [OC,IC,K]: weight_norm normalizes over dim=0 (shape[0]).
 static void vae_fuse_wn(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & pfx) {
     struct ggml_tensor * mv = ggml_get_tensor(gf.meta, (pfx + ".weight_v").c_str());
     const uint16_t * g = (const uint16_t *)gf_get_data(gf, (pfx + ".weight_g").c_str());
@@ -90,6 +90,35 @@ static void vae_fuse_wn(struct ggml_tensor * dst, const GGUFModel & gf, const st
     } else {
         ggml_backend_tensor_set(dst, w.data(), 0, w.size() * sizeof(float));
     }
+}
+
+// Fuse weight_norm for ConvTranspose1d AND transpose to [IC, K*OC] layout for mul_mat.
+// GGUF weight_v is [K, OC, IC] (ggml ne[0]=K, ne[1]=OC, ne[2]=IC).
+// weight_norm dim0=IC, fan=K*OC.  Fused output: w[ic*K_OC + k_oc].
+// We need dst [IC, K*OC] in GGML (ne[0]=IC): element (ic, k_oc) = data[ic + k_oc*IC].
+// So we transpose during fuse: data[k_oc * IC + ic] = fused[ic * K_OC + k_oc].
+static void vae_fuse_wn_ct(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & pfx) {
+    struct ggml_tensor * mv = ggml_get_tensor(gf.meta, (pfx + ".weight_v").c_str());
+    const uint16_t * g = (const uint16_t *)gf_get_data(gf, (pfx + ".weight_g").c_str());
+    const uint16_t * v = (const uint16_t *)gf_get_data(gf, (pfx + ".weight_v").c_str());
+    int n_dims = ggml_n_dims(mv);
+    int dim0 = (int)mv->ne[n_dims - 1];   // IC
+    int fan  = (int)(ggml_nelements(mv) / dim0);  // K * OC
+    std::vector<float> w(dim0 * fan);
+    for (int d = 0; d < dim0; d++) {       // d = ic
+        float gv = ggml_bf16_to_fp32(*(const ggml_bf16_t *)&g[d]);
+        float nsq = 0;
+        for (int i = 0; i < fan; i++) {
+            float vv = ggml_bf16_to_fp32(*(const ggml_bf16_t *)&v[d * fan + i]);
+            nsq += vv * vv;
+        }
+        float s = gv / (sqrtf(nsq) + 1e-12f);
+        for (int i = 0; i < fan; i++) {    // i = k_oc
+            float vv = ggml_bf16_to_fp32(*(const ggml_bf16_t *)&v[d * fan + i]);
+            w[i * dim0 + d] = vv * s;     // transposed: [k_oc * IC + ic]
+        }
+    }
+    ggml_backend_tensor_set(dst, w.data(), 0, w.size() * sizeof(float));
 }
 
 // Load bf16 snake param [1,C,1] -> exp -> f32 [1, C]
@@ -156,7 +185,7 @@ static void vae_ggml_load(VAEGGML * m, const char * path) {
         int C    = out_ch[i];
         b.sa  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, in_ch[i]);
         b.sb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, in_ch[i]);
-        b.ctw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, b.kernel, out_ch[i], in_ch[i]);
+        b.ctw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in_ch[i], b.kernel * out_ch[i]);
         b.ctb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_ch[i]);
         for (int r = 0; r < 3; r++) {
             VAEResUnit & ru = b.ru[r];
@@ -194,7 +223,7 @@ static void vae_ggml_load(VAEGGML * m, const char * path) {
         std::string blk_pfx = "decoder.block." + std::to_string(i);
         vae_load_snake(b.sa, gf, blk_pfx + ".snake1.alpha");
         vae_load_snake_inv(b.sb, gf, blk_pfx + ".snake1.beta");
-        vae_fuse_wn(b.ctw, gf, blk_pfx + ".conv_t1");
+        vae_fuse_wn_ct(b.ctw, gf, blk_pfx + ".conv_t1");
         vae_load_bias(b.ctb, gf, blk_pfx + ".conv_t1.bias");
         for (int r = 0; r < 3; r++) {
             VAEResUnit & ru = b.ru[r];
@@ -250,22 +279,34 @@ static struct ggml_tensor * vae_conv1d(
     return y;
 }
 
-// ConvTranspose1d + bias
+// ConvTranspose1d via GEMM + col2im (replaces naive ggml_conv_transpose_1d)
+// w: [IC, K*OC] pre-permuted at load time for mul_mat
+// x: [T_in, IC]
+// Returns: [T_out_cropped, OC]
 static struct ggml_tensor * vae_conv_t1d(
         struct ggml_context * ctx,
-        struct ggml_tensor * w,    // [K, out_ch, in_ch]
-        struct ggml_tensor * b,    // [out_ch] or NULL
-        struct ggml_tensor * x,    // [T, in_ch]
-        int stride, int padding) {
-    // ggml_conv_transpose_1d asserts p0==0, so we crop manually
-    struct ggml_tensor * y = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
-    // y is 4d: [OL, OC, 1, 1], squeeze to 2d
-    y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
-    // Crop padding from both sides: [OL, OC] -> [OL - 2*pad, OC]
+        struct ggml_tensor * w,    // [IC, K*OC] pre-permuted
+        struct ggml_tensor * b,    // [OC] or NULL
+        struct ggml_tensor * x,    // [T_in, IC]
+        int stride, int padding, int oc) {
+    // Step 1: Transpose x from [T_in, IC] to [IC, T_in] (contiguous copy)
+    struct ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+
+    // Step 2: GEMM - contracts over IC (ne[0] of both)
+    // w: [IC, K*OC]  xt: [IC, T_in]  ->  col: [K*OC, T_in]
+    struct ggml_tensor * col = ggml_mul_mat(ctx, w, xt);
+
+    // Step 3: col2im - scatter-add columns to signal
+    // [K*OC, T_in] -> [T_out, OC] where T_out = (T_in-1)*stride + K
+    struct ggml_tensor * y = ggml_col2im_1d(ctx, col, stride, oc);
+
+    // Step 4: Crop padding from both sides (GGML conv_transpose_1d asserts p0==0)
     if (padding > 0) {
         y = ggml_view_2d(ctx, y, y->ne[0] - 2 * padding, y->ne[1],
                          y->nb[1], padding * sizeof(float));
     }
+
+    // Step 5: Add bias
     if (b) {
         struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
         y = ggml_add(ctx, y, b2d);
@@ -306,7 +347,7 @@ static struct ggml_tensor * vae_ggml_build_graph(
         // snake -> conv_transpose (upsample)
         x = vae_snake(ctx, x, b.sa, b.sb);
         int pad = (b.kernel - b.stride) / 2;
-        x = vae_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, pad);
+        x = vae_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, pad, b.out_ch);
         // 3 res units
         for (int r = 0; r < 3; r++)
             x = vae_res_unit(ctx, &b.ru[r], x);
