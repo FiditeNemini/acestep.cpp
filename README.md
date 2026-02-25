@@ -187,7 +187,7 @@ All fields with defaults. Only `caption` is required.
     "lm_cfg_scale":       2.0,
     "lm_top_p":           0.9,
     "lm_top_k":           0,
-    "lm_negative_prompt": "NO USER INPUT",
+    "lm_negative_prompt": "",
     "audio_codes":        "",
     "inference_steps":    8,
     "guidance_scale":     7.0,

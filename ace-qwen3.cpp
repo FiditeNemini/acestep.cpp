@@ -300,8 +300,7 @@ static std::vector<int> build_lm_prompt_uncond(BPETokenizer & bpe, const AceProm
     ids.push_back(TOKEN_IM_END);
     append("\n");
     ids.push_back(TOKEN_IM_START);
-    bool has_neg = negative_prompt && strlen(negative_prompt) > 0
-                   && strcmp(negative_prompt, "NO USER INPUT") != 0;
+    bool has_neg = negative_prompt && strlen(negative_prompt) > 0;
     if (has_neg)
         append("user\n# Caption\n" + std::string(negative_prompt) + "\n\n# Lyric\n" + prompt.lyrics + "\n");
     else
@@ -394,8 +393,7 @@ static std::vector<int> build_lm_prompt_uncond_with_cot(BPETokenizer & bpe, cons
     ids.push_back(TOKEN_IM_END);
     append("\n");
     ids.push_back(TOKEN_IM_START);
-    bool has_neg = negative_prompt && strlen(negative_prompt) > 0
-                   && strcmp(negative_prompt, "NO USER INPUT") != 0;
+    bool has_neg = negative_prompt && strlen(negative_prompt) > 0;
     std::string cap = has_neg ? std::string(negative_prompt) : prompt.caption;
     append("user\n# Caption\n" + cap + "\n\n# Lyric\n" + prompt.lyrics + "\n");
     ids.push_back(TOKEN_IM_END);
