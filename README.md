@@ -276,6 +276,30 @@ dit-vae
   WAV stereo 48kHz
 ```
 
+## LM specifics
+
+ace-qwen3 is not a general-purpose chat engine. It is a two-phase autoregressive
+pipeline specialized for ACE-Step music generation.
+
+Phase 1 (CoT) generates structured metadata (bpm, keyscale, timesignature, caption,
+duration, language) and optionally lyrics via chain-of-thought reasoning. An FSM
+(finite state machine) built from a prefix tree enforces valid field names and values
+at every decode step, hard-masking invalid tokens before sampling.
+
+Phase 2 (audio codes) generates 5Hz FSQ tokens from a 65535-code vocabulary appended
+to the base Qwen3 tokenizer. A partial LM head projects only the audio code subrange
+of the embedding matrix, cutting the output GEMM by 70% compared to full-vocab
+projection. Classifier-free guidance (CFG) is fused into the batch dimension: N
+conditional and N unconditional sequences are packed into a single forward pass
+(2*N tokens, one weight read), then combined as
+`logits = uncond + scale * (cond - uncond)`. The KV cache is a single 4D tensor
+`[D, max_seq, Nkv, n_sets]` shared across all batch elements and CFG paths. Shared
+prompts are prefilled once and cloned to other KV sets via copy, avoiding redundant
+prefills. Embedding lookup bypasses ggml_get_rows entirely: rows are read directly
+from the mmap'd GGUF file on CPU, dequantized, and uploaded as F32 input tensors.
+Decode uses a dedicated single-backend graph allocator (gallocr) with no scheduler
+dispatch overhead, while prefill uses the multi-backend scheduler for flexibility.
+
 ## Accuracy
 
 Test logs (turbo + SFT, seed 42, Philox noise, multiple quantizations):
