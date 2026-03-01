@@ -47,6 +47,7 @@ struct Qwen3LM {
     ggml_backend_t cpu_backend;
     ggml_backend_sched_t sched; // prefill (variable shapes, runs once)
     ggml_gallocr_t galloc;      // decode  (single GPU, tight loop)
+    bool use_flash_attn;
 
     // CPU-side embed lookup via mmap (avoids ggml_get_rows which lacks
     // CUDA K-quant support, preventing costly cross-backend tensor copies)
@@ -151,6 +152,7 @@ static void qw3lm_init_backend(Qwen3LM * m) {
     m->cpu_backend = bp.cpu_backend;
     m->sched = backend_sched_new(bp, 8192);
     m->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+    m->use_flash_attn = true;
 }
 
 // Allocate KV cache
@@ -287,7 +289,8 @@ static struct ggml_tensor * qw3lm_build_attn(
         struct ggml_tensor * cache_v, // [D, max_seq, Nkv] f16
         int kv_pos,
         int kv_len,
-        int n_tokens) {
+        int n_tokens,
+        bool use_flash_attn = true) {
 
     int D   = c.head_dim;
     int Nh  = c.n_heads;
@@ -356,10 +359,13 @@ static struct ggml_tensor * qw3lm_build_attn(
     struct ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, kv_len, Nkv, nb1, nb2, 0);
     struct ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, kv_len, Nkv, nb1, nb2, 0);
 
-    // Flash attention
+    // Attention (flash or F32 manual fallback)
     float scale = 1.0f / sqrtf((float)D);
-    struct ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32); // F32 accumulation
+    struct ggml_tensor * attn = use_flash_attn
+        ? ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f)
+        : qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale);
+    if (use_flash_attn)
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 
     // Reshape: [D, Nh, S] -> [Nh*D, S]
     attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
@@ -421,7 +427,7 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
         struct ggml_tensor * attn = qw3lm_build_attn(
             ctx, gf, c, ly, norm, positions, mask,
             m->kv_k[kv_set][l], m->kv_v[kv_set][l],
-            kv_pos, kv_len, n_tokens);
+            kv_pos, kv_len, n_tokens, m->use_flash_attn);
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
@@ -639,10 +645,12 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
             m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3],
             (size_t)s0 * m->kv_v4[l]->nb[3]);
 
-        // Batched flash attention: 1 kernel per layer instead of N
-        struct ggml_tensor * attn_result = ggml_flash_attn_ext(ctx,
-            q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
+        // Batched attention (flash or F32 manual fallback)
+        struct ggml_tensor * attn_result = m->use_flash_attn
+            ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f)
+            : qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale);
+        if (m->use_flash_attn)
+            ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
 
         // Output: [D, Nh, 1, N] -> [Nh*D, N]
         struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);

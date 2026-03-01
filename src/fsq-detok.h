@@ -61,6 +61,7 @@ struct DetokGGML {
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
     ggml_backend_sched_t sched;
+    bool use_flash_attn;
     WeightCtx wctx;
 };
 
@@ -70,6 +71,7 @@ static bool detok_ggml_load(DetokGGML * m, const char * gguf_path,
     m->cfg = detok_config();
     m->backend = backend;
     m->cpu_backend = cpu_backend;
+    m->use_flash_attn = true;
 
     GGUFModel gf;
     if (!gf_load(&gf, gguf_path)) {
@@ -166,7 +168,8 @@ static int detok_ggml_decode(DetokGGML * m, const int * codes, int T_5Hz,
 
     // 2L encoder + norm (non-causal, no mask needed at S=5)
     hidden = qwen3_build_layers(ctx, m->cfg, m->layers, m->norm,
-                                 hidden, positions, NULL, P);
+                                 hidden, positions, NULL, P,
+                                 m->use_flash_attn);
 
     // proj_out: [2048, 5] -> [64, 5]
     struct ggml_tensor * output = ggml_mul_mat(ctx, m->proj_out_w, hidden);

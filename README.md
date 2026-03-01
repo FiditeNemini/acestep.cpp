@@ -220,6 +220,7 @@ Output naming: input.json -> input0.json, input1.json, ... (last digit = batch i
 Debug:
   --max-seq <N>          KV cache size (default: 8192)
   --no-fsm               Disable FSM constrained decoding
+  --no-fa                Disable flash attention
   --dump-logits <path>   Dump prefill logits (binary f32)
   --dump-tokens <path>   Dump prompt token IDs (CSV)
 ```
@@ -251,6 +252,7 @@ VAE tiling (memory control):
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
 Debug:
+  --no-fa                 Disable flash attention
   --dump <dir>            Dump intermediate tensors
 ```
 

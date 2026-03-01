@@ -560,6 +560,7 @@ static void usage(const char * prog) {
         "Debug:\n"
         "  --max-seq <N>          KV cache size (default: 8192)\n"
         "  --no-fsm               Disable FSM constrained decoding\n"
+        "  --no-fa                Disable flash attention\n"
         "  --dump-logits <path>   Dump prefill logits (binary f32)\n"
         "  --dump-tokens <path>   Dump prompt token IDs (CSV)\n"
         , prog);
@@ -571,6 +572,7 @@ int main(int argc, char ** argv) {
     int max_seq     = 8192;
     int batch_size  = 1;
     bool use_fsm    = true;
+    bool use_fa     = true;
     const char * dump_logits  = nullptr;
     const char * dump_tokens  = nullptr;
 
@@ -590,6 +592,8 @@ int main(int argc, char ** argv) {
             batch_size = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-fsm"))
             use_fsm = false;
+        else if (!strcmp(argv[i], "--no-fa"))
+            use_fa = false;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc)
             dump_logits = argv[++i];
         else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc)
@@ -651,6 +655,7 @@ int main(int argc, char ** argv) {
     Timer t_load;
     Qwen3LM model;
     if (!qw3lm_load(&model, model_path, max_seq, n_kv_sets)) return 1;
+    model.use_flash_attn = use_fa;
     double load_ms = t_load.ms();
 
     // FSM

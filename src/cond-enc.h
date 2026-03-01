@@ -69,6 +69,7 @@ struct CondGGML {
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
     ggml_backend_sched_t sched;
+    bool use_flash_attn;
     WeightCtx wctx;
 };
 
@@ -78,6 +79,7 @@ static void cond_ggml_init_backend(CondGGML * m) {
     m->backend = bp.backend;
     m->cpu_backend = bp.cpu_backend;
     m->sched = backend_sched_new(bp, 8192);
+    m->use_flash_attn = true;
 }
 
 // Load from ACEStep DiT GGUF
@@ -191,7 +193,8 @@ static void cond_ggml_forward(CondGGML * m,
     for (int i = 0; i < m->lyric_cfg.n_layers; i++) {
         struct ggml_tensor * layer_mask = (i % 2 == 0) ? lyric_slide_mask : NULL;
         lyric_h = qwen3_build_layer(ctx, m->lyric_cfg, &m->lyric_layers[i],
-                                     lyric_h, lyric_pos, layer_mask, S_lyric);
+                                     lyric_h, lyric_pos, layer_mask, S_lyric,
+                                     m->use_flash_attn);
     }
     lyric_h = qwen3_rms_norm(ctx, lyric_h, m->lyric_norm, m->lyric_cfg.rms_norm_eps);
 
@@ -236,7 +239,8 @@ static void cond_ggml_forward(CondGGML * m,
         for (int i = 0; i < m->timbre_cfg.n_layers; i++) {
             struct ggml_tensor * layer_mask = (i % 2 == 0) ? timbre_slide_mask : NULL;
             timbre_h = qwen3_build_layer(ctx, m->timbre_cfg, &m->timbre_layers[i],
-                                          timbre_h, timbre_pos, layer_mask, S_ref);
+                                          timbre_h, timbre_pos, layer_mask, S_ref,
+                                          m->use_flash_attn);
         }
         timbre_h = qwen3_rms_norm(ctx, timbre_h, m->timbre_norm, m->timbre_cfg.rms_norm_eps);
 
