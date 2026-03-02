@@ -317,9 +317,9 @@ python3 debug-dit-cossim.py       # DiT: per-layer cossim GGML vs Python (turbo/
 
 ## Patched GGML fork
 
-Uses a patched GGML fork (submodule) with two new ops and a CUDA bugfix for the Oobleck
-VAE decoder. All backends: CPU, CUDA, Metal, Vulkan. F32/F16/BF16 data types.
-The DiT uses only standard GGML ops and needs no patches.
+Uses a patched GGML fork (submodule) with two new ops, a Metal im2col optimization, and
+a CUDA bugfix for the Oobleck VAE decoder. All backends: CPU, CUDA, Metal, Vulkan.
+F32/F16/BF16 data types. The DiT uses only standard GGML ops and needs no patches.
 
 The VAE reconstructs audio from latent space through 5 upsampling blocks (total 1920x),
 each running a transposed convolution followed by 3 WaveNet-style residual units with
@@ -346,6 +346,25 @@ element, no shared memory, no tensor cores). The VAE spends 40% of its FLOP budg
 transposed convolutions. We decompose each as `mul_mat + col2im_1d`, routing the heavy
 GEMM through cuBLAS/BLAS/MPS tensor cores. The col2im_1d gather has a 2-iteration inner
 loop and is pure bandwidth. BF16 cast nodes around col2im_1d halve the scatter bandwidth.
+
+### Metal: `kernel_im2col_1d` (flat 1D dispatch)
+
+The generic Metal `kernel_im2col` dispatches (IC, 1, OW) threadgroups with K threads
+each. For the VAE's 1D convolutions with small kernels (k=1 or k=7), this wastes 78-97%
+of SIMD lanes (7 or 1 active threads per 32-wide SIMD group). The dedicated
+`kernel_im2col_1d` uses a flat dispatch identical to snake and col2im_1d:
+(total/256, 1, 1) threadgroups with 256 threads, achieving full SIMD utilization.
+The dispatch branches on `is_2D` at runtime; the 2D path and kernel are unchanged.
+CUDA and Vulkan already use flat dispatch and are not affected.
+
+VAE decode (M2 Pro 16GB, 86.8s audio @ 48kHz stereo):
+
+| chunk | overlap | im2col    | tiles | time   |
+|------:|--------:|-----------|------:|-------:|
+|   256 |      64 | generic   |    17 | 71.2s  |
+|  1024 |      16 | generic   |     3 | 38.9s  |
+|   256 |      64 | im2col_1d |    17 | 31.8s  |
+|  1024 |      16 | im2col_1d |     3 | 18.3s  |
 
 ### Bugfix: `im2col` gridDim.y overflow (CUDA)
 
