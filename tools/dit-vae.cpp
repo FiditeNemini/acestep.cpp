@@ -265,8 +265,6 @@ int main(int argc, char ** argv) {
             seed = (long long)rd() << 32 | rd();
             if (seed < 0) seed = -seed;
         }
-        fprintf(stderr, "[Pipeline] seed=%lld, steps=%d, guidance=%.1f, shift=%.1f, duration=%.1fs\n",
-                seed, num_steps, guidance_scale, shift, duration);
 
         // Audio codes from request JSON (passthrough mode only, NOT cover)
         std::vector<int> codes_vec = parse_codes_string(req.audio_codes);
@@ -286,6 +284,8 @@ int main(int argc, char ** argv) {
         int T;
         if (have_cover) {
             T = T_cover;
+            // duration in metas must match actual source length, not JSON default
+            duration = (float)T_cover / (float)FRAMES_PER_SECOND;
         } else if (!codes_vec.empty()) {
             T = (int)codes_vec.size() * 5;
         } else {
@@ -296,6 +296,8 @@ int main(int argc, char ** argv) {
         int enc_S = 0;
 
         fprintf(stderr, "[Pipeline] T=%d, S=%d\n", T, S);
+        fprintf(stderr, "[Pipeline] seed=%lld, steps=%d, guidance=%.1f, shift=%.1f, duration=%.1fs\n",
+                seed, num_steps, guidance_scale, shift, duration);
 
         if (T > 15000) {
             fprintf(stderr, "ERROR: T=%d exceeds silence_latent max 15000, skipping\n", T);
