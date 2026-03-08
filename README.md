@@ -433,6 +433,10 @@ Required:
 Reference audio:
   --src-audio <wav>       Source audio (48kHz stereo WAV)
 
+LoRA:
+  --lora <path>           LoRA safetensors file or directory
+  --lora-scale <float>    LoRA scaling factor (default: 1.0)
+
 Batch:
   --batch <N>             DiT variations per request (default: 1, max 9)
 
@@ -441,10 +445,6 @@ Output naming: input.json -> input0.wav, input1.wav, ... (last digit = batch ind
 VAE tiling (memory control):
   --vae-chunk <N>         Latent frames per tile (default: 256)
   --vae-overlap <N>       Overlap frames per side (default: 64)
-
-LoRA:
-  --lora <path>           LoRA safetensors file or directory
-  --lora-scale <float>    LoRA scaling factor (default: 1.0)
 
 Debug:
   --no-fa                 Disable flash attention
