@@ -32,6 +32,9 @@ static void print_usage(const char * prog) {
             "  --vae <gguf>            VAE GGUF file\n\n"
             "Reference audio:\n"
             "  --src-audio <wav>       Source audio (48kHz stereo WAV)\n\n"
+            "LoRA:\n"
+            "  --lora <path>           LoRA safetensors file or directory\n"
+            "  --lora-scale <float>    LoRA scaling factor (default: 1.0)\n\n"
             "Batch:\n"
             "  --batch <N>             DiT variations per request (default: 1, max 9)\n\n"
             "Output naming: input.json -> input0.wav, input1.wav, ... (last digit = batch index)\n\n"
@@ -78,6 +81,8 @@ int main(int argc, char ** argv) {
     const char *              vae_gguf       = NULL;
     const char *              src_audio_path = NULL;
     const char *              dump_dir       = NULL;
+    const char *              lora_path      = NULL;
+    float                     lora_scale     = 1.0f;
     bool                      use_fa         = true;
     int                       batch_n        = 1;
     int                       vae_chunk      = 256;
@@ -97,6 +102,10 @@ int main(int argc, char ** argv) {
             vae_gguf = argv[++i];
         } else if (strcmp(argv[i], "--src-audio") == 0 && i + 1 < argc) {
             src_audio_path = argv[++i];
+        } else if (strcmp(argv[i], "--lora") == 0 && i + 1 < argc) {
+            lora_path = argv[++i];
+        } else if (strcmp(argv[i], "--lora-scale") == 0 && i + 1 < argc) {
+            lora_scale = (float) atof(argv[++i]);
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
             dump_dir = argv[++i];
         } else if (strcmp(argv[i], "--no-fa") == 0) {
@@ -154,7 +163,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[Load] Backend init: %.1f ms\n", timer.ms());
 
     timer.reset();
-    if (!dit_ggml_load(&model, dit_gguf, cfg)) {
+    if (!dit_ggml_load(&model, dit_gguf, cfg, lora_path, lora_scale)) {
         fprintf(stderr, "[DiT] FATAL: failed to load model\n");
         return 1;
     }
