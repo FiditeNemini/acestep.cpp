@@ -56,17 +56,21 @@ static inline float mp3enc_spreading_db(float dz) {
 struct mp3enc_psy {
     // Output: allowed distortion energy per SFB
     float xmin[MP3ENC_PSY_SFB_MAX];
+    float xmin_short[12][3];  // short block masking thresholds
+
+    // Forward masking: previous granule's masking energy (per channel)
+    float prev_mask[2][MP3ENC_PSY_SFB_MAX];
 
     // Precomputed per-SFB data (set once per sample rate)
     float ath_energy[3][MP3ENC_PSY_SFB_MAX];  // [sr_index][sfb]: ATH in linear power
     float sfb_bark[3][MP3ENC_PSY_SFB_MAX];    // [sr_index][sfb]: center freq in Bark
+    float ath_short[3][12];                   // [sr_index][sfb]: short block ATH
     bool  ath_valid;
 
     void init() {
         ath_valid = false;
-        for (int i = 0; i < MP3ENC_PSY_SFB_MAX; i++) {
-            xmin[i] = 0.0f;
-        }
+        memset(xmin, 0, sizeof(xmin));
+        memset(prev_mask, 0, sizeof(prev_mask));
     }
 
     // Precompute ATH energy and Bark positions per SFB.
@@ -99,14 +103,37 @@ struct mp3enc_psy {
                 }
             }
 
-            // Convert dB SPL to linear power, normalized so 96 dB SPL = 1.0
-            // (16 bit full scale). Scale by band width so it's total energy.
-            float ath_linear          = powf(10.0f, (ath_min_db - 96.0f) * 0.1f) * (float) width;
+            // Convert dB SPL to linear power, scaled by band width.
+            // Reference at 120 dB SPL (tuned empirically). A higher reference
+            // makes the ATH floor less dominant relative to the spreading
+            // function, so bits are spent on perceptual masking rather than
+            // fighting the absolute hearing threshold in quiet passages.
+            float ath_linear          = powf(10.0f, (ath_min_db - 120.0f) * 0.1f) * (float) width;
             ath_energy[sr_index][sfb] = ath_linear;
 
             pos += width;
         }
         ath_valid = true;
+    }
+
+    // Precompute ATH for short block SFBs.
+    // Short blocks: 192 lines per window, freq_per_line = sr / (2*192).
+    void init_ath_short(int sr_index, const uint8_t * sfb_table, int sample_rate) {
+        float freq_per_line = (float) sample_rate / (2.0f * 192.0f);
+        int   pos           = 0;
+        for (int sfb = 0; sfb < 12; sfb++) {
+            int   width      = sfb_table[sfb * 3];  // all 3 windows have same width
+            float ath_min_db = 200.0f;
+            for (int j = 0; j < width; j++) {
+                float freq = ((float) (pos + j) + 0.5f) * freq_per_line;
+                float db   = mp3enc_ath_db(freq);
+                if (db < ath_min_db) {
+                    ath_min_db = db;
+                }
+            }
+            ath_short[sr_index][sfb] = powf(10.0f, (ath_min_db - 120.0f) * 0.1f) * (float) width;
+            pos += width;
+        }
     }
 
     // Compute masking thresholds for one granule/channel.
@@ -121,7 +148,7 @@ struct mp3enc_psy {
     // mdct: 576 MDCT coefficients (after MS stereo if applicable)
     // sfb_table: SFB widths for this sample rate
     // sr_index: sample rate index
-    void compute(const float * mdct, const uint8_t * sfb_table, int sr_index) {
+    void compute(const float * mdct, const uint8_t * sfb_table, int sr_index, int ch = 0) {
         float energy[MP3ENC_PSY_SFB_MAX];
         float tonality[MP3ENC_PSY_SFB_MAX];
 
@@ -188,13 +215,12 @@ struct mp3enc_psy {
         }
 
         // Step 3: compute masking offset per SFB.
-        // ISO 11172-3: tonal masking noise (TMN) = 14.5 dB, noise masking tone (NMT) = 5.5 dB.
-        // Interpolate by tonality: offset_db = alpha * 14.5 + (1-alpha) * 5.5
-        // Higher offset = more conservative masking (less noise tolerated).
+        // TMN/NMT from ISO 11172-3, relaxed empirically for 128kbps.
+        // TMN=13.0 (tonal masking noise), NMT=4.5 (noise masking tone).
         float offset_linear[MP3ENC_PSY_SFB_MAX];
         for (int sfb = 0; sfb < MP3ENC_PSY_SFB_MAX; sfb++) {
             float alpha        = tonality[sfb];
-            float offset_db    = alpha * 14.5f + (1.0f - alpha) * 5.5f;
+            float offset_db    = alpha * 13.0f + (1.0f - alpha) * 4.5f;
             offset_linear[sfb] = powf(10.0f, -offset_db * 0.1f);
         }
 
@@ -236,6 +262,49 @@ struct mp3enc_psy {
 
             xmin[sfb] = (mask > ath) ? mask : ath;
         }
+
+        // Step 6: forward masking (temporal).
+        // A loud granule raises the masking threshold for the next granule.
+        // At 44.1kHz one granule = 13ms. Forward masking decays ~12dB over 13ms.
+        // Decay factor: 10^(-12/10) = ~0.063.
+        static const float fwd_decay = 0.063f;
+        for (int sfb = 0; sfb < MP3ENC_PSY_SFB_MAX; sfb++) {
+            float fwd = prev_mask[ch][sfb] * fwd_decay;
+            if (fwd > xmin[sfb]) {
+                xmin[sfb] = fwd;
+            }
+            // Save current mask (spread_energy, not xmin) for next granule
+            prev_mask[ch][sfb] = spread_energy[sfb];
+        }
+    }
+
+    // Compute masking thresholds for short blocks.
+    // Simplified model: energy-based masking with ATH, no bark spreading.
+    // Short blocks prioritize temporal resolution over spectral precision.
+    //
+    // mdct: 576 coefficients in sfb-grouped order (after reorder).
+    // sfb_table: short block SFB widths (triples: w0,w0,w0, w1,w1,w1, ...).
+    void compute_short(const float * mdct, const uint8_t * sfb_table, int sr_index) {
+        // Noise-like masking offset: -5.5 dB (ISO 11172-3 Annex D)
+        static const float offset = 0.2818f;  // 10^(-5.5/10)
+
+        int pos = 0;
+        for (int sfb = 0; sfb < 12; sfb++) {
+            int width = sfb_table[sfb * 3];
+            for (int w = 0; w < 3; w++) {
+                float e = 0.0f;
+                for (int j = 0; j < width; j++) {
+                    float x = mdct[pos + j];
+                    e += x * x;
+                }
+                pos += width;
+
+                // Masking threshold: max of ATH and energy-based mask
+                float mask         = e * offset;
+                float ath          = ath_short[sr_index][sfb];
+                xmin_short[sfb][w] = (mask > ath) ? mask : ath;
+            }
+        }
     }
 
     // Detect transients in the PCM for block type switching.
@@ -259,9 +328,7 @@ struct mp3enc_psy {
             }
         }
 
-        // A transient is detected if any sub-window's energy is 10x (10 dB)
-        // greater than the previous sub-window. This threshold is conservative
-        // enough to avoid false positives on gradual changes.
+        // A transient is detected if any sub-window's energy jumps 10x (10 dB).
         for (int w = 1; w < 4; w++) {
             if (energy[w] > energy[w - 1] * 10.0f) {
                 return true;

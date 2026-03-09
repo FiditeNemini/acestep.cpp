@@ -18,7 +18,7 @@ static inline int mp3enc_quantize_value(float xr, float istep) {
     if (val > 8191.0f) {
         return 8191;
     }
-    int ix = (int) (val + 0.4054f);  // rounding bias for better SNR
+    int ix = (int) (val + 0.36f);  // rounding bias for better SNR
     return ix;
 }
 
@@ -35,7 +35,7 @@ static inline int mp3enc_quantize_value(float xr, float istep) {
 static void mp3enc_quantize_sfb(const float *   xr,
                                 int *           ix,
                                 int             global_gain,
-                                const int *     scalefac_l,
+                                const int *     scalefac,
                                 int             scalefac_scale,
                                 int             preflag,
                                 const uint8_t * sfb_table) {
@@ -43,10 +43,10 @@ static void mp3enc_quantize_sfb(const float *   xr,
     float ss    = scalefac_scale ? 1.0f : 0.5f;
 
     int pos = 0;
-    for (int sfb = 0; sfb < 21 && pos < 576; sfb++) {
+    for (int sfb = 0; sfb_table[sfb] != 0 && pos < 576; sfb++) {
         int width = sfb_table[sfb];
 
-        int   sf      = scalefac_l[sfb] + (preflag ? mp3enc_pretab[sfb] : 0);
+        int   sf      = scalefac[sfb] + (preflag ? mp3enc_pretab[sfb] : 0);
         float sfb_amp = (sf > 0) ? powf(2.0f, ss * (float) sf) : 1.0f;
 
         for (int j = 0; j < width && pos < 576; j++, pos++) {
@@ -56,12 +56,11 @@ static void mp3enc_quantize_sfb(const float *   xr,
             if (val > 8191.0f) {
                 q = 8191;
             } else {
-                q = (int) (val + 0.4054f);
+                q = (int) (val + 0.36f);
             }
             ix[pos] = (xr[pos] >= 0.0f) ? q : -q;
         }
     }
-    // Remaining lines beyond SFB 21 (should not happen with 576 lines)
     while (pos < 576) {
         ix[pos++] = 0;
     }
@@ -84,7 +83,7 @@ static void mp3enc_quantize(const float * xr, int * ix, int global_gain) {
 static void mp3enc_calc_noise(const float *   xr,
                               const int *     ix,
                               int             global_gain,
-                              const int *     scalefac_l,
+                              const int *     scalefac,
                               int             scalefac_scale,
                               int             preflag,
                               const uint8_t * sfb_table,
@@ -93,9 +92,9 @@ static void mp3enc_calc_noise(const float *   xr,
     float ss   = scalefac_scale ? 1.0f : 0.5f;
 
     int pos = 0;
-    for (int sfb = 0; sfb < 21 && pos < 576; sfb++) {
+    for (int sfb = 0; sfb_table[sfb] != 0 && pos < 576; sfb++) {
         int   width    = sfb_table[sfb];
-        int   sf       = scalefac_l[sfb] + (preflag ? mp3enc_pretab[sfb] : 0);
+        int   sf       = scalefac[sfb] + (preflag ? mp3enc_pretab[sfb] : 0);
         float sfb_gain = (sf > 0) ? powf(2.0f, -ss * (float) sf) : 1.0f;
 
         float n = 0.0f;
@@ -149,36 +148,65 @@ static int mp3enc_count_bits(const int * ix, mp3enc_granule_info & gi, const uin
     int region_end[3] = { 0, 0, bv_end };
 
     if (gi.block_type == 2) {
-        // Short blocks: 2 regions, fixed split at line 36.
-        // Region 0 covers the first 36 spectral lines (9 short SFBs * 4 width).
+        // Short blocks: 2 regions, split at line 36.
+        // Region 0 covers the first 36 spectral lines.
         // Region 1 covers the rest up to big_values.
-        // No region0_count/region1_count in side info for block_type=2.
+        // No region0_count/region1_count in side info for short blocks.
         region_end[0] = (36 < bv_end) ? 36 : bv_end;
         region_end[1] = bv_end;
         region_end[2] = bv_end;
     } else if (gi.block_type == 0) {
-        int r0 = 8, r1 = 0;
-        if (bv_end > 0) {
-            int total_sfb = 0;
-            int acc       = 0;
-            for (int sfb = 0; sfb < 21; sfb++) {
+        // Try a few region0_count values and pick the best.
+        int total_sfb   = 0;
+        int sfb_acc[22] = {};
+        {
+            int acc = 0;
+            for (int sfb = 0; sfb < 22; sfb++) {
                 acc += sfb_table[sfb];
-                if (acc > bv_end) {
-                    break;
+                sfb_acc[sfb] = acc;
+                if (acc <= bv_end) {
+                    total_sfb = sfb + 1;
                 }
-                total_sfb = sfb + 1;
-            }
-            r0 = (total_sfb > 8) ? 8 : total_sfb;
-            r1 = total_sfb - r0;
-            if (r1 > 8) {
-                r1 = 8;  // 3 bit field, max value 7 means max 8 sfb
-            }
-            if (r1 < 0) {
-                r1 = 0;
             }
         }
-        gi.region0_count = (r0 > 0) ? r0 - 1 : 0;
-        gi.region1_count = (r1 > 0) ? r1 - 1 : 0;
+
+        int best_r0 = 7, best_r1 = 0, best_rbits = 999999;
+        for (int r0t = 5; r0t < 11 && r0t < total_sfb; r0t++) {
+            int r1t = total_sfb - r0t - 1;
+            if (r1t < 0) {
+                r1t = 0;
+            }
+            if (r1t > 7) {
+                r1t = 7;
+            }
+            int re0  = (sfb_acc[r0t] < bv_end) ? sfb_acc[r0t] : bv_end;
+            int sfb1 = r0t + r1t + 1;
+            if (sfb1 > 21) {
+                sfb1 = 21;
+            }
+            int re1 = (sfb_acc[sfb1] < bv_end) ? sfb_acc[sfb1] : bv_end;
+
+            int t0    = mp3enc_choose_table(ix, 0, re0 / 2);
+            int t1    = mp3enc_choose_table(ix, re0, (re1 - re0) / 2);
+            int t2    = mp3enc_choose_table(ix, re1, (bv_end - re1) / 2);
+            int rbits = 0;
+            for (int i = 0; i < re0; i += 2) {
+                rbits += mp3enc_pair_bits(t0, ix[i], ix[i + 1]);
+            }
+            for (int i = re0; i < re1; i += 2) {
+                rbits += mp3enc_pair_bits(t1, ix[i], ix[i + 1]);
+            }
+            for (int i = re1; i < bv_end; i += 2) {
+                rbits += mp3enc_pair_bits(t2, ix[i], ix[i + 1]);
+            }
+            if (rbits < best_rbits) {
+                best_rbits = rbits;
+                best_r0    = r0t;
+                best_r1    = r1t;
+            }
+        }
+        gi.region0_count = best_r0;
+        gi.region1_count = best_r1;
 
         // Compute region end positions
         {
@@ -302,14 +330,17 @@ static int mp3enc_best_scalefac_compress(const int * scalefac_l) {
 }
 
 // Inner loop: binary search on global_gain to fit the bit budget.
-// Quantizes with the given scalefactors.
+// Quantizes with the given scalefactors (flat array, works for long or short blocks).
+// scalefac: flat scalefac array (scalefac_l for long, flattened scalefac_s for short).
+//           Pass NULL for no scalefactors (initial call before outer loop).
 // Returns actual Huffman bits used (not including scalefactor bits).
 static int mp3enc_inner_loop(const float *         xr,
                              int *                 ix,
                              mp3enc_granule_info & gi,
                              int                   available_bits,
                              const uint8_t *       sfb_table,
-                             int                   sr_index) {
+                             int                   sr_index,
+                             const int *           scalefac = nullptr) {
     int lo = 0, hi = 255;
     int best_gain = 210;
     int best_bits = available_bits + 1;
@@ -318,11 +349,10 @@ static int mp3enc_inner_loop(const float *         xr,
         int mid = (lo + hi) / 2;
 
         // Quantize with scalefactors
-        if (gi.scalefac_compress == 0) {
-            // No scalefactors, fast path
+        if (!scalefac || gi.scalefac_compress == 0) {
             mp3enc_quantize(xr, ix, mid);
         } else {
-            mp3enc_quantize_sfb(xr, ix, mid, gi.scalefac_l, gi.scalefac_scale, gi.preflag, sfb_table);
+            mp3enc_quantize_sfb(xr, ix, mid, scalefac, gi.scalefac_scale, gi.preflag, sfb_table);
         }
 
         // Check for saturation
@@ -352,10 +382,10 @@ static int mp3enc_inner_loop(const float *         xr,
 
     // Final quantization with the best gain
     gi.global_gain = best_gain;
-    if (gi.scalefac_compress == 0) {
+    if (!scalefac || gi.scalefac_compress == 0) {
         mp3enc_quantize(xr, ix, best_gain);
     } else {
-        mp3enc_quantize_sfb(xr, ix, best_gain, gi.scalefac_l, gi.scalefac_scale, gi.preflag, sfb_table);
+        mp3enc_quantize_sfb(xr, ix, best_gain, scalefac, gi.scalefac_scale, gi.preflag, sfb_table);
     }
     best_bits = mp3enc_count_bits(ix, gi, sfb_table, sr_index);
     return best_bits;
@@ -452,8 +482,7 @@ static int mp3enc_outer_loop(const float *         xr,
         }
 
         // Bump scalefactor for EVERY band where noise > threshold.
-        // This is the key difference from the old code which only bumped
-        // the worst band. The ISO spec says to amplify all distorted bands.
+        // ISO outer loop: amplify all distorted bands by 1 step per iteration.
         bool any_changed = false;
         for (int sfb = 0; sfb < 21; sfb++) {
             if (xmin[sfb] > 0.0f && noise[sfb] > xmin[sfb]) {
@@ -520,7 +549,7 @@ static int mp3enc_outer_loop(const float *         xr,
         }
 
         // Re-run inner loop
-        huff_bits = mp3enc_inner_loop(xr, ix, gi, huff_budget, sfb_table, sr_index);
+        huff_bits = mp3enc_inner_loop(xr, ix, gi, huff_budget, sfb_table, sr_index, gi.scalefac_l);
         int total = part2 + huff_bits;
 
         if (total <= available_bits) {
@@ -535,5 +564,201 @@ static int mp3enc_outer_loop(const float *         xr,
     memcpy(ix, best_ix, sizeof(best_ix));
     gi.part2_3_length = best_total;
 
+    return gi.part2_3_length;
+}
+
+// Flatten scalefac_s[12][3] into a 39-element array matching sfb-grouped order.
+// 13 sfb bands x 3 windows = 39 entries. sfb 12 (last band) has no scalefactor (0).
+static void mp3enc_flatten_sf_short(const int sf_s[12][3], int * flat) {
+    for (int sfb = 0; sfb < 12; sfb++) {
+        for (int w = 0; w < 3; w++) {
+            flat[sfb * 3 + w] = sf_s[sfb][w];
+        }
+    }
+    // sfb 12: no scalefactor
+    flat[36] = flat[37] = flat[38] = 0;
+}
+
+// Best scalefac_compress for short blocks.
+// slen1 covers sfb 0..5, slen2 covers sfb 6..11 (each x3 windows).
+static int mp3enc_best_compress_short(const int sf_s[12][3]) {
+    int max1 = 0, max2 = 0;
+    for (int sfb = 0; sfb < 6; sfb++) {
+        for (int w = 0; w < 3; w++) {
+            if (sf_s[sfb][w] > max1) {
+                max1 = sf_s[sfb][w];
+            }
+        }
+    }
+    for (int sfb = 6; sfb < 12; sfb++) {
+        for (int w = 0; w < 3; w++) {
+            if (sf_s[sfb][w] > max2) {
+                max2 = sf_s[sfb][w];
+            }
+        }
+    }
+
+    int best_compress = 0, best_bits = 999;
+    for (int c = 0; c < 16; c++) {
+        int s1   = mp3enc_slen[0][c];
+        int s2   = mp3enc_slen[1][c];
+        int cap1 = (s1 > 0) ? ((1 << s1) - 1) : 0;
+        int cap2 = (s2 > 0) ? ((1 << s2) - 1) : 0;
+        if (max1 > cap1 || max2 > cap2) {
+            continue;
+        }
+        int bits = 18 * s1 + 18 * s2;  // 6 sfb * 3 win * slen
+        if (bits < best_bits) {
+            best_bits     = bits;
+            best_compress = c;
+        }
+    }
+    return best_compress;
+}
+
+// Part2 length for short blocks: 6*3*slen1 + 6*3*slen2.
+// No scfsi for short blocks.
+static int mp3enc_part2_length_short(int scalefac_compress) {
+    int slen1 = mp3enc_slen[0][scalefac_compress];
+    int slen2 = mp3enc_slen[1][scalefac_compress];
+    return 18 * slen1 + 18 * slen2;
+}
+
+// Outer loop for short blocks.
+// xmin_short[12][3]: masking thresholds per (sfb, window) from psy model.
+static int mp3enc_outer_loop_short(const float *         xr,
+                                   int *                 ix,
+                                   mp3enc_granule_info & gi,
+                                   const float           xmin_short[12][3],
+                                   int                   available_bits,
+                                   const uint8_t *       sfb_table,
+                                   int                   sr_index) {
+    memset(&gi, 0, sizeof(gi));
+    gi.block_type = 2;
+
+    // Flatten xmin: 39 entries (13 sfb x 3 win). sfb 12 gets 0 (no threshold).
+    float xmin_flat[39] = {};
+    for (int sfb = 0; sfb < 12; sfb++) {
+        for (int w = 0; w < 3; w++) {
+            xmin_flat[sfb * 3 + w] = xmin_short[sfb][w];
+        }
+    }
+
+    // Initial inner loop (no scalefactors)
+    int huff_bits     = mp3enc_inner_loop(xr, ix, gi, available_bits, sfb_table, sr_index);
+    gi.part2_3_length = huff_bits;
+
+    // Check if any psy thresholds are set
+    bool have_psy = false;
+    for (int i = 0; i < 36; i++) {
+        if (xmin_flat[i] > 0.0f) {
+            have_psy = true;
+            break;
+        }
+    }
+    if (!have_psy) {
+        return gi.part2_3_length;
+    }
+
+    // Outer loop iteration
+    float               noise[39];
+    int                 best_ix[576];
+    mp3enc_granule_info best_gi    = gi;
+    int                 best_total = gi.part2_3_length;
+    int                 best_over  = 36;
+    memcpy(best_ix, ix, sizeof(best_ix));
+
+    for (int iter = 0; iter < 20; iter++) {
+        // Flatten current scalefactors
+        int sf_flat[39];
+        mp3enc_flatten_sf_short(gi.scalefac_s, sf_flat);
+
+        // Compute noise per flat band
+        mp3enc_calc_noise(xr, ix, gi.global_gain, sf_flat, gi.scalefac_scale, 0, sfb_table, noise);
+
+        // Count over-threshold bands
+        int over_count = 0;
+        for (int i = 0; i < 36; i++) {
+            if (xmin_flat[i] > 0.0f && noise[i] > xmin_flat[i]) {
+                over_count++;
+            }
+        }
+
+        // Track best
+        if (over_count < best_over || (over_count == best_over && gi.part2_3_length < best_total)) {
+            best_gi    = gi;
+            best_total = gi.part2_3_length;
+            best_over  = over_count;
+            memcpy(best_ix, ix, sizeof(best_ix));
+        }
+        if (over_count == 0) {
+            break;
+        }
+
+        // Bump scalefactors for over-threshold bands
+        bool any_changed = false;
+        for (int sfb = 0; sfb < 12; sfb++) {
+            for (int w = 0; w < 3; w++) {
+                int idx = sfb * 3 + w;
+                if (xmin_flat[idx] > 0.0f && noise[idx] > xmin_flat[idx]) {
+                    gi.scalefac_s[sfb][w]++;
+                    any_changed = true;
+                }
+            }
+        }
+        if (!any_changed) {
+            break;
+        }
+
+        // scalefac_scale: if any sf exceeds 15, double step size
+        int max_sf = 0;
+        for (int sfb = 0; sfb < 12; sfb++) {
+            for (int w = 0; w < 3; w++) {
+                if (gi.scalefac_s[sfb][w] > max_sf) {
+                    max_sf = gi.scalefac_s[sfb][w];
+                }
+            }
+        }
+        if (max_sf > 15 && !gi.scalefac_scale) {
+            gi.scalefac_scale = 1;
+            for (int sfb = 0; sfb < 12; sfb++) {
+                for (int w = 0; w < 3; w++) {
+                    gi.scalefac_s[sfb][w] = (gi.scalefac_s[sfb][w] + 1) / 2;
+                }
+            }
+        }
+
+        // Clamp to 15
+        for (int sfb = 0; sfb < 12; sfb++) {
+            for (int w = 0; w < 3; w++) {
+                if (gi.scalefac_s[sfb][w] > 15) {
+                    gi.scalefac_s[sfb][w] = 15;
+                }
+            }
+        }
+
+        // Update compress and bit budget
+        gi.scalefac_compress = mp3enc_best_compress_short(gi.scalefac_s);
+        int part2            = mp3enc_part2_length_short(gi.scalefac_compress);
+        int huff_budget      = available_bits - part2;
+        if (huff_budget < 0) {
+            break;
+        }
+
+        // Re-flatten and re-run inner loop
+        mp3enc_flatten_sf_short(gi.scalefac_s, sf_flat);
+        huff_bits = mp3enc_inner_loop(xr, ix, gi, huff_budget, sfb_table, sr_index, sf_flat);
+        int total = part2 + huff_bits;
+
+        if (total <= available_bits) {
+            gi.part2_3_length = total;
+        } else {
+            break;
+        }
+    }
+
+    gi = best_gi;
+    memcpy(ix, best_ix, sizeof(best_ix));
+    gi.part2_3_length = best_total;
     return gi.part2_3_length;
 }

@@ -116,6 +116,7 @@ static mp3enc_t * mp3enc_init(int sample_rate, int channels, int bitrate_kbps) {
     memset(enc->sb_prev, 0, sizeof(enc->sb_prev));
     enc->psy.init();
     enc->psy.init_ath(enc->sr_index, mp3enc_sfb_long[enc->sr_index], sample_rate);
+    enc->psy.init_ath_short(enc->sr_index, mp3enc_sfb_short[enc->sr_index], sample_rate);
 
     // Bit reservoir: max 511 bytes (9 bit field main_data_begin)
     enc->resv_size = 0;
@@ -232,8 +233,9 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
     int main_data_bytes = frame_bytes - 4 - side_info_bytes;
     int main_data_bits  = main_data_bytes * 8;
 
-    // Get SFB table for this sample rate
-    const uint8_t * sfb = mp3enc_sfb_long[enc->sr_index];
+    // SFB tables for this sample rate
+    const uint8_t * sfb_long  = mp3enc_sfb_long[enc->sr_index];
+    const uint8_t * sfb_short = mp3enc_sfb_short[enc->sr_index];
 
     // Process 2 granules (each is 576 samples = 18 subband slots of 32 samples)
     mp3enc_side_info si;
@@ -269,8 +271,11 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
     for (int gr = 0; gr < 2; gr++) {
         int pcm_offset = gr * 576;
 
-        // Block type: long blocks only (block_type=0).
-        // Short blocks (block_type=2) require forward MDCT-12 verification.
+        // Block type: long blocks only for now.
+        // Short block infrastructure is ready (MDCT-12, sfb reorder, outer loop)
+        // but causes ODG regression at 128kbps because the simplified psy model
+        // and high scalefactor overhead outweigh the transient benefit.
+        // TODO: enable with block_type 1/3 transitions + full psy short.
         int block_type = 0;
 
         // Step 1: filterbank + MDCT for all channels
@@ -294,7 +299,7 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
             }
 
             // MDCT: transform subbands to 576 frequency lines
-            mp3enc_mdct_granule(enc->sb_prev[ch], enc->sb_cur[ch], mdct_lr[ch], block_type);
+            mp3enc_mdct_granule(enc->sb_prev[ch], enc->sb_cur[ch], mdct_lr[ch], block_type, enc->sr_index);
 
             // Save current subbands as previous for next granule
             memcpy(enc->sb_prev[ch], enc->sb_cur[ch], sizeof(enc->sb_cur[ch]));
@@ -341,20 +346,17 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
         int gr_bits_used = 0;
         for (int ch = 0; ch < nch; ch++) {
             if (block_type == 2) {
-                // Short blocks: use inner loop only (no scalefactor iteration).
-                // The short MDCT already handles pre-echo by using 3 short windows.
-                // Per-window scalefactors would improve quality further but are
-                // complex to implement (Phase 2d).
-                memset(&si.gr[gr][ch], 0, sizeof(si.gr[gr][ch]));
-                si.gr[gr][ch].block_type = 2;
-                int bits = mp3enc_inner_loop(mdct_lr[ch], ix[gr][ch], si.gr[gr][ch], bits_per_ch, sfb, enc->sr_index);
+                // Short blocks: psy model + outer loop with scalefac_s.
+                enc->psy.compute_short(mdct_lr[ch], sfb_short, enc->sr_index);
+                int bits = mp3enc_outer_loop_short(mdct_lr[ch], ix[gr][ch], si.gr[gr][ch], enc->psy.xmin_short,
+                                                   bits_per_ch, sfb_short, enc->sr_index);
                 si.gr[gr][ch].part2_3_length = bits;
                 gr_bits_used += bits;
             } else {
                 // Long blocks: full psy model + outer loop
-                enc->psy.compute(mdct_lr[ch], sfb, enc->sr_index);
-                int bits = mp3enc_outer_loop(mdct_lr[ch], ix[gr][ch], si.gr[gr][ch], enc->psy.xmin, bits_per_ch, sfb,
-                                             enc->sr_index, gr, si.scfsi[ch]);
+                enc->psy.compute(mdct_lr[ch], sfb_long, enc->sr_index, ch);
+                int bits = mp3enc_outer_loop(mdct_lr[ch], ix[gr][ch], si.gr[gr][ch], enc->psy.xmin, bits_per_ch,
+                                             sfb_long, enc->sr_index, gr, si.scfsi[ch]);
                 gr_bits_used += bits;
             }
         }
@@ -391,7 +393,7 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
             int n_regions = (gi.block_type == 0) ? 3 : 2;
             for (int r = 0; r < n_regions; r++) {
                 int reg_end;
-                if (gi.block_type == 2) {
+                if (gi.block_type != 0) {
                     // Short blocks: 2 regions, split at line 36
                     if (r == 0) {
                         reg_end = (36 < gi.big_values * 2) ? 36 : gi.big_values * 2;
@@ -403,13 +405,13 @@ static int mp3enc_encode_frame(mp3enc_t * enc, const float * pcm) {
                     if (r == 0) {
                         int acc = 0;
                         for (int s = 0; s <= gi.region0_count; s++) {
-                            acc += sfb[s];
+                            acc += sfb_long[s];
                         }
                         reg_end = (acc < gi.big_values * 2) ? acc : gi.big_values * 2;
                     } else if (r == 1) {
                         int acc = 0;
                         for (int s = 0; s <= gi.region0_count + gi.region1_count + 1; s++) {
-                            acc += sfb[s];
+                            acc += sfb_long[s];
                         }
                         reg_end = (acc < gi.big_values * 2) ? acc : gi.big_values * 2;
                     } else {

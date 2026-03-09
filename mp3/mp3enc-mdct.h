@@ -10,19 +10,13 @@
 #ifndef M_PI
 #    define M_PI 3.14159265358979323846
 #endif
-// Combined window + forward MDCT for long blocks.
-// in[36] = prev[18] + cur[18] (raw subband samples, no pre-windowing)
+// Forward MDCT-36 for long blocks.
+// in[36] = prev[18] + cur[18] (raw subband samples)
 // out[18] = MDCT frequency coefficients
 //
 // Formula (ISO 11172-3 Annex C):
-//   out[k] = sum(n=0..35) in[n] * sin(PI/36 * (n + 0.5))
-//                                * cos(PI/72 * (2*n + 19) * (2*k + 1))
-//
-// The sin() term IS the normal block window (block_type 0).
+//   out[k] = (1/9) * sum(n=0..35) in[n] * sin(pi/36*(n+0.5)) * cos(pi/72*(2n+19)*(2k+1))
 static void mp3enc_mdct36(const float * in, float * out) {
-    // The raw MDCT sum over 36 windowed samples gives values 9x what the
-    // decoder's IMDCT expects. Factor 1/9 = 2/N_half compensates, where
-    // N_half = 18 is the number of MDCT coefficients per subband.
     for (int k = 0; k < 18; k++) {
         float sum = 0.0f;
         for (int n = 0; n < 36; n++) {
@@ -80,8 +74,9 @@ static void mp3enc_mdct_short(const float * in, float * out) {
                 sum += x[n] * win * cos_val;
             }
             // Interleaved storage: line k of window w goes to position w + k*3.
-            // Normalization: 2/N_half = 2/6 = 1/3 (standard MDCT normalization).
-            out[w + k * 3] = sum * (1.0f / 9.0f);
+            // Normalization: 2/N_half = 2/6 = 1/3 (short block MDCT normalization).
+            // Long blocks use 2/18 = 1/9 because N_half=18; short blocks have N_half=6.
+            out[w + k * 3] = sum * (1.0f / 3.0f);
         }
     }
 }
@@ -92,9 +87,9 @@ static void mp3enc_mdct_short(const float * in, float * out) {
 static void mp3enc_mdct_granule(const float sb_prev[32][18],
                                 const float sb_cur[32][18],
                                 float *     mdct_out,
-                                int         block_type) {
+                                int         block_type,
+                                int         sr_index) {
     for (int band = 0; band < 32; band++) {
-        // assemble 36 samples: prev[18] + cur[18]
         float mdct_in[36];
         for (int k = 0; k < 18; k++) {
             mdct_in[k]      = sb_prev[band][k];
@@ -102,15 +97,33 @@ static void mp3enc_mdct_granule(const float sb_prev[32][18],
         }
 
         if (block_type == 2) {
-            // Short blocks: 3 windows of MDCT-12, interleaved output
             mp3enc_mdct_short(mdct_in, mdct_out + band * 18);
         } else {
             mp3enc_mdct36(mdct_in, mdct_out + band * 18);
         }
     }
 
-    // Alias reduction: only for long blocks (ISO 11172-3, clause 2.4.3.4)
-    if (block_type != 2) {
+    // Alias reduction: only for long blocks (ISO 11172-3, clause 2.4.3.4).
+    if (block_type == 0) {
         mp3enc_alias_reduce(mdct_out);
+    }
+
+    // Short blocks: reorder from subband-interleaved to sfb-grouped order.
+    // The MP3 bitstream stores short block values in sfb-grouped order.
+    // The decoder's L3_reorder converts back to interleaved for IMDCT.
+    if (block_type == 2) {
+        float           tmp[576];
+        const float *   src = mdct_out;
+        float *         dst = tmp;
+        const uint8_t * sfb = mp3enc_sfb_short[sr_index];
+        for (int len; 0 != (len = *sfb); sfb += 3) {
+            for (int i = 0; i < len; i++) {
+                dst[0 * len + i] = *src++;
+                dst[1 * len + i] = *src++;
+                dst[2 * len + i] = *src++;
+            }
+            dst += 3 * len;
+        }
+        memcpy(mdct_out, tmp, 576 * sizeof(float));
     }
 }
