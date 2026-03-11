@@ -531,7 +531,17 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  lyrics: %zu chars\n", parsed.lyrics.size());
     }
 
-    // Step 7: write output JSON (reusable as ace-qwen3 or dit-vae input)
+    // Step 7: write output JSON (reusable as dit-vae input with codes)
+    // Build audio_codes string from recovered codes (comma-separated)
+    std::string codes_str;
+    for (size_t i = 0; i < codes.size(); i++) {
+        if (i > 0) {
+            codes_str += ',';
+        }
+        codes_str += std::to_string(codes[i]);
+    }
+    fprintf(stderr, "  audio_codes: %zu codes\n", codes.size());
+
     if (output_path) {
         AceRequest out;
         request_init(&out);
@@ -542,6 +552,7 @@ int main(int argc, char ** argv) {
         out.keyscale       = parsed.keyscale;
         out.timesignature  = parsed.timesignature;
         out.vocal_language = parsed.vocal_language;
+        out.audio_codes    = codes_str;
         request_write(&out, output_path);
     }
 
