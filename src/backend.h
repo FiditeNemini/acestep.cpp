@@ -26,6 +26,25 @@ struct BackendPair {
 static BackendPair g_backend_cache = {};
 static int         g_backend_refs  = 0;
 
+// Standalone CPU backend via Registry API (DL-safe, no ggml-cpu.h needed).
+// Returns NULL on failure. Caller must check.
+static ggml_backend_t cpu_backend_new(void) {
+    int n_threads = (int) std::thread::hardware_concurrency() / 2;
+    if (n_threads < 1) {
+        n_threads = 1;
+    }
+    char params[64];
+    snprintf(params, sizeof(params), "n_threads=%d", n_threads);
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev) {
+        ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, params);
+        if (cpu) {
+            return cpu;
+        }
+    }
+    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, params);
+}
+
 // Initialize backends: load all available (CUDA, Metal, Vulkan...),
 // pick the best one, keep CPU as fallback.
 // label: log prefix, e.g. "DiT", "VAE", "LM"
@@ -45,34 +64,19 @@ static BackendPair backend_init(const char * label) {
         exit(1);
     }
     bool best_is_cpu = (strcmp(ggml_backend_name(bp.backend), "CPU") == 0);
-    int n_threads = (int) std::thread::hardware_concurrency() / 2;
-    if (n_threads < 1) {
-        n_threads = 1;
-    }
-    // Initialize CPU backend with explicit thread count
-    char params[64];
-    snprintf(params, sizeof(params), "n_threads=%d", n_threads);
-    auto init_cpu_backend = [&]() -> ggml_backend_t {
-        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        if (cpu_dev) {
-            if (ggml_backend_t cpu = ggml_backend_dev_init(cpu_dev, params)) {
-                return cpu;
-            }
-        }
-        return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, params);
-    };
-
     if (best_is_cpu) {
         ggml_backend_free(bp.backend);
-        bp.backend = init_cpu_backend();
+        bp.backend     = cpu_backend_new();
         bp.cpu_backend = bp.backend;
     } else {
-        bp.cpu_backend = init_cpu_backend();
+        bp.cpu_backend = cpu_backend_new();
     }
     if (!bp.cpu_backend) {
         fprintf(stderr, "[Load] FATAL: failed to init CPU backend\n");
         exit(1);
     }
+    int n_threads = (int) std::thread::hardware_concurrency() / 2;
+    if (n_threads < 1) { n_threads = 1; }
     fprintf(stderr, "[Load] %s backend: %s (CPU threads: %d)\n", label, ggml_backend_name(bp.backend), n_threads);
 
     bp.gpu_cc = 0;
