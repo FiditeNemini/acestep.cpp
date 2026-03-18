@@ -5,12 +5,14 @@
 // All functions use planar stereo float: [L: T samples][R: T samples].
 // Part of acestep.cpp. MIT license.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <string>
+#include <thread>
+#include <vector>
 
 // wav.h: WAV reader (returns interleaved, we deinterleave below)
 #include "wav.h"
@@ -374,54 +376,129 @@ static std::string audio_encode_mp3(const float * audio,
         enc_sr    = 44100;
     }
 
-    mp3enc_t * enc = mp3enc_init(enc_sr, 2, kbps);
-    if (!enc) {
-        fprintf(stderr, "[Audio] mp3enc_init failed: %d Hz, %d kbps\n", enc_sr, kbps);
-        free(resampled);
+    float duration = (float) enc_T / (float) enc_sr;
+    fprintf(stderr, "[MP3] Encoding %.1fs @ %d kbps, %d Hz stereo\n", duration, kbps, enc_sr);
+
+    // thread count: all logical cores. MP3 is ALU-bound with small working set,
+    // hyperthreads help (unlike GGML GEMM which shares SIMD units).
+    // minimum ~2s per chunk so filter warmup at boundaries is negligible.
+    int n_threads = (int) std::thread::hardware_concurrency();
+    if (n_threads < 1) {
+        n_threads = 1;
+    }
+    int total_frames = (enc_T + 1151) / 1152;
+    int min_frames   = (enc_sr * 2 + 1151) / 1152;  // ~2s worth of frames
+    int max_threads  = total_frames / (min_frames > 0 ? min_frames : 1);
+    if (max_threads < 1) {
+        max_threads = 1;
+    }
+    if (n_threads > max_threads) {
+        n_threads = max_threads;
+    }
+
+    // per-thread sample ranges, aligned to 1152 (MP3 frame boundary).
+    // each thread gets its own encoder: independent bit reservoir, filter state.
+    // boundary cost: ~32 samples of filter warmup + reservoir reset per chunk.
+    // at 48kHz that is < 1ms of audio, totally inaudible.
+    struct chunk_range {
+        int start;
+        int end;
+    };
+
+    std::vector<chunk_range> ranges(n_threads);
+    {
+        int base = total_frames / n_threads;
+        int rem  = total_frames % n_threads;
+        int f    = 0;
+        for (int t = 0; t < n_threads; t++) {
+            int nf          = base + (t < rem ? 1 : 0);
+            ranges[t].start = f * 1152;
+            f += nf;
+            ranges[t].end = (t == n_threads - 1) ? enc_T : f * 1152;
+        }
+    }
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    std::vector<std::string> results(n_threads);
+
+    // worker: encode one chunk with a private encoder instance.
+    // feeds 1-second sub-chunks for cancel responsiveness.
+    auto worker = [&](int tid) {
+        int chunk_start = ranges[tid].start;
+        int chunk_len   = ranges[tid].end - chunk_start;
+        if (chunk_len <= 0) {
+            return;
+        }
+
+        mp3enc_t * e = mp3enc_init(enc_sr, 2, kbps);
+        if (!e) {
+            return;
+        }
+
+        int sub = enc_sr;  // ~1 second
+        for (int p = 0; p < chunk_len; p += sub) {
+            if (cancel && cancel(cancel_data)) {
+                break;
+            }
+            int len = (p + sub <= chunk_len) ? sub : (chunk_len - p);
+
+            // build planar sub-chunk: [L: len][R: len]
+            float * buf = (float *) malloc((size_t) len * 2 * sizeof(float));
+            memcpy(buf, enc_audio + chunk_start + p, (size_t) len * sizeof(float));
+            memcpy(buf + len, enc_audio + enc_T + chunk_start + p, (size_t) len * sizeof(float));
+
+            int             sz  = 0;
+            const uint8_t * mp3 = mp3enc_encode(e, buf, len, &sz);
+            results[tid].append((const char *) mp3, (size_t) sz);
+            free(buf);
+        }
+
+        int             flush_sz = 0;
+        const uint8_t * flush    = mp3enc_flush(e, &flush_sz);
+        results[tid].append((const char *) flush, (size_t) flush_sz);
+        mp3enc_free(e);
+    };
+
+    // fork-join: main thread takes chunk 0, spawn threads for the rest
+    if (n_threads == 1) {
+        worker(0);
+    } else {
+        std::vector<std::thread> threads;
+        for (int t = 1; t < n_threads; t++) {
+            threads.emplace_back(worker, t);
+        }
+        worker(0);
+        for (auto & th : threads) {
+            th.join();
+        }
+    }
+
+    auto  t_end     = std::chrono::steady_clock::now();
+    float encode_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+
+    free(resampled);
+
+    if (cancel && cancel(cancel_data)) {
+        fprintf(stderr, "[MP3] Cancelled\n");
         return "";
     }
 
+    // concatenate thread outputs (order = chunk order = correct MP3 stream)
+    size_t total_bytes = 0;
+    for (auto & r : results) {
+        total_bytes += r.size();
+    }
     std::string out;
-    float       duration = (float) enc_T / (float) enc_sr;
-    out.reserve((size_t) ((float) kbps * 128.0f * duration));  // rough: kbps*1000/8*dur
-
-    fprintf(stderr, "[MP3] Encoding %.1fs @ %d kbps, %d Hz stereo\n", duration, kbps, enc_sr);
-    clock_t t_start = clock();
-
-    // encode in 1-second chunks
-    int chunk = enc_sr;
-    for (int pos = 0; pos < enc_T; pos += chunk) {
-        if (cancel && cancel(cancel_data)) {
-            fprintf(stderr, "[MP3] Cancelled\n");
-            mp3enc_free(enc);
-            free(resampled);
-            return "";
-        }
-        int n = (pos + chunk <= enc_T) ? chunk : (enc_T - pos);
-
-        // build planar chunk for this segment
-        float * buf = (float *) malloc((size_t) n * 2 * sizeof(float));
-        memcpy(buf, enc_audio + pos, (size_t) n * sizeof(float));
-        memcpy(buf + n, enc_audio + enc_T + pos, (size_t) n * sizeof(float));
-
-        int             out_size = 0;
-        const uint8_t * mp3      = mp3enc_encode(enc, buf, n, &out_size);
-        out.append((const char *) mp3, (size_t) out_size);
-        free(buf);
+    out.reserve(total_bytes);
+    for (auto & r : results) {
+        out.append(r);
     }
 
-    int             flush_size = 0;
-    const uint8_t * flush_data = mp3enc_flush(enc, &flush_size);
-    out.append((const char *) flush_data, (size_t) flush_size);
-
-    float encode_ms = (float) (clock() - t_start) * 1000.0f / (float) CLOCKS_PER_SEC;
-    float realtime  = (encode_ms > 0.0f) ? (duration * 1000.0f / encode_ms) : 0.0f;
-
-    mp3enc_free(enc);
-    free(resampled);
-
-    float ratio = (enc_T > 0) ? (float) (enc_T * 2 * 2) / (float) out.size() : 0.0f;
-    fprintf(stderr, "[MP3] %zu bytes (%.1f:1), %.0f ms (%.2fx realtime)\n", out.size(), ratio, encode_ms, realtime);
+    float realtime = (encode_ms > 0.0f) ? (duration * 1000.0f / encode_ms) : 0.0f;
+    float ratio    = (enc_T > 0) ? (float) (enc_T * 2 * 2) / (float) out.size() : 0.0f;
+    fprintf(stderr, "[MP3] %zu bytes (%.1f:1), %.0f ms (%.2fx realtime), %d threads\n", out.size(), ratio, encode_ms,
+            realtime, n_threads);
     return out;
 }
 
