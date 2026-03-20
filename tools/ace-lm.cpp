@@ -22,6 +22,7 @@ static void usage(const char * prog) {
             "  --max-seq <N>          KV cache size (default: 8192)\n"
             "  --no-fsm               Disable FSM constrained decoding\n"
             "  --no-fa                Disable flash attention\n"
+            "  --no-batch-cfg         Split CFG into two N=1 forwards\n"
             "  --dump-logits <path>   Dump prefill logits (binary f32)\n"
             "  --dump-tokens <path>   Dump prompt token IDs (CSV)\n",
             prog);
@@ -51,6 +52,8 @@ int main(int argc, char ** argv) {
             params.use_fsm = false;
         } else if (!strcmp(argv[i], "--no-fa")) {
             params.use_fa = false;
+        } else if (!strcmp(argv[i], "--no-batch-cfg")) {
+            params.use_batch_cfg = false;
         } else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) {
             dump_logits = argv[++i];
         } else if (!strcmp(argv[i], "--dump-tokens") && i + 1 < argc) {

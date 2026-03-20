@@ -545,7 +545,8 @@ static void usage(const char * prog) {
             "\n"
             "Debug:\n"
             "  --no-fsm                Disable FSM constrained decoding\n"
-            "  --no-fa                 Disable flash attention\n",
+            "  --no-fa                 Disable flash attention\n"
+            "  --no-batch-cfg          Split CFG into two N=1 forwards\n",
             prog);
 }
 
@@ -611,6 +612,8 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--no-fa")) {
             lm_params.use_fa    = false;
             synth_params.use_fa = false;
+        } else if (!strcmp(argv[i], "--no-batch-cfg")) {
+            lm_params.use_batch_cfg = false;
 
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]);

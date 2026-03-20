@@ -11,11 +11,12 @@
 struct AceLm;
 
 struct AceLmParams {
-    const char * model_path;  // LM GGUF (required)
-    int          max_seq;     // KV cache length (default: 8192)
-    int          max_batch;   // max batch_size for generate (default: 4)
-    bool         use_fsm;     // constrained decoding (default: true)
-    bool         use_fa;      // flash attention (default: true)
+    const char * model_path;     // LM GGUF (required)
+    int          max_seq;        // KV cache length (default: 8192)
+    int          max_batch;      // max batch_size for generate (default: 4)
+    bool         use_fsm;        // constrained decoding (default: true)
+    bool         use_fa;         // flash attention (default: true)
+    bool         use_batch_cfg;  // batch cond+uncond in one forward (default: true)
 };
 
 void ace_lm_default_params(AceLmParams * p);

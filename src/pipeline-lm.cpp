@@ -273,6 +273,7 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
                                                  int                            N,
                                                  float                          cfg_scale,
                                                  const char *                   negative_prompt,
+                                                 bool                           use_batch_cfg,
                                                  bool (*cancel)(void *) = nullptr,
                                                  void * cancel_data     = nullptr) {
     int  V             = m->cfg.vocab_size;
@@ -453,9 +454,19 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
         }
 
         // 2. FORWARD PASS: GPU only computes attention for n_active sequences
-        int actual_batch_size = use_cfg ? (2 * n_active) : n_active;
-        qw3lm_forward_batch(m, batch_tokens.data(), batch_sets.data(), actual_batch_size, batch_logits.data(),
-                            lm_offset, lm_count);
+        if (use_cfg && !use_batch_cfg) {
+            // Two separate N=1 forwards (cond, then uncond).
+            // Workaround for backends where batched multi-sequence attention
+            // produces wrong results (e.g. ROCm/gfx1201). Same logit layout.
+            qw3lm_forward_batch(m, batch_tokens.data(), batch_sets.data(), n_active, batch_logits.data(), lm_offset,
+                                lm_count);
+            qw3lm_forward_batch(m, batch_tokens.data() + n_active, batch_sets.data() + n_active, n_active,
+                                batch_logits.data() + (size_t) n_active * out_V, lm_offset, lm_count);
+        } else {
+            int actual_batch_size = use_cfg ? (2 * n_active) : n_active;
+            qw3lm_forward_batch(m, batch_tokens.data(), batch_sets.data(), actual_batch_size, batch_logits.data(),
+                                lm_offset, lm_count);
+        }
 
         // 3. TARGETED CFG & LOGIT EXTRACTION
         for (int a = 0; a < n_active; a++) {
@@ -531,11 +542,12 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
 // Public API
 
 void ace_lm_default_params(AceLmParams * p) {
-    p->model_path = NULL;
-    p->max_seq    = 8192;
-    p->max_batch  = 4;
-    p->use_fsm    = true;
-    p->use_fa     = true;
+    p->model_path    = NULL;
+    p->max_seq       = 8192;
+    p->max_batch     = 4;
+    p->use_fsm       = true;
+    p->use_fa        = true;
+    p->use_batch_cfg = true;
 }
 
 AceLm * ace_lm_load(const AceLmParams * params) {
@@ -738,7 +750,7 @@ int ace_lm_generate(AceLm *            ctx,
     std::vector<std::string> batch_codes(batch_size);
     if (!user_has_codes) {
         batch_codes = run_phase2_batch(&ctx->model, ctx->bpe, aces, temperature, top_p, top_k, seed, batch_size,
-                                       cfg_scale, neg_prompt, cancel, cancel_data);
+                                       cfg_scale, neg_prompt, ctx->params.use_batch_cfg, cancel, cancel_data);
         if (batch_codes.empty()) {
             return -1;
         }

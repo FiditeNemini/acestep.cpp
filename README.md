@@ -465,6 +465,7 @@ Debug:
   --max-seq <N>          KV cache size (default: 8192)
   --no-fsm               Disable FSM constrained decoding
   --no-fa                Disable flash attention
+  --no-batch-cfg         Split CFG into two N=1 forwards
   --dump-logits <path>   Dump prefill logits (binary f32)
   --dump-tokens <path>   Dump prompt token IDs (CSV)
 ```
@@ -573,6 +574,7 @@ Server:
 Debug:
   --no-fsm                Disable FSM constrained decoding
   --no-fa                 Disable flash attention
+  --no-batch-cfg          Split CFG into two N=1 forwards
 ```
 
 Examples:
