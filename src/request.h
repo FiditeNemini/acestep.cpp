@@ -44,16 +44,16 @@ struct AceRequest {
     float guidance_scale;   // 0 = auto (1.0 for all models)
     float shift;            // 0 = auto (turbo: 3.0, base/sft: 1.0)
 
-    // cover mode (active when --src-audio is provided on CLI)
+    // cover mode (active when source audio is provided)
     float audio_cover_strength;  // 0.5 (0-1, fraction of DiT steps using source context)
 
-    // repaint mode (requires --src-audio)
+    // repaint mode (requires source audio)
     // Both -1 = no repaint (plain cover). One or both >= 0 activates repaint.
     // -1 on start means 0s, -1 on end means source duration.
     float repainting_start;  // -1
     float repainting_end;    // -1
 
-    // lego mode (requires --src-audio, base model only)
+    // lego mode (requires source audio, base model only)
     // Track name from TRACK_NAMES: vocals, backing_vocals, drums, bass, guitar,
     // keyboard, percussion, strings, synth, fx, brass, woodwinds.
     // Empty = not lego. Sets instruction, cover path, strength=1.0.

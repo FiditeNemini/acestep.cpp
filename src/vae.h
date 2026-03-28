@@ -450,7 +450,7 @@ static int vae_ggml_decode(VAEGGML * m, const float * latent, int T_latent, floa
 // stride = chunk_size - 2*overlap
 // For each tile: decode latent window with overlap context, trim to core, concatenate.
 // Default chunk=256/overlap=64 matches reference code. Larger chunks (e.g. 1024)
-// reduce tile count and improve throughput; use --vae-chunk/--vae-overlap to tune.
+// reduce tile count and improve throughput; adjust chunk/overlap to tune.
 // Returns T_audio (total samples per channel) or -1 on error.
 static int vae_ggml_decode_tiled(VAEGGML *     m,
                                  const float * latent,     // [T_latent, 64] flat time-major (DiT output layout)

@@ -256,10 +256,6 @@ int ace_synth_generate(AceSynth *         ctx,
     std::vector<float> cover_latents;  // [T_cover, 64] time-major
     int                T_cover = 0;
     if (src_audio && src_len > 0) {
-        if (!ctx->params.vae_path) {
-            fprintf(stderr, "[Cover] ERROR: --src-audio requires --vae\n");
-            return -1;
-        }
         timer.reset();
         int T_audio = src_len;
 
@@ -286,16 +282,11 @@ int ace_synth_generate(AceSynth *         ctx,
     // seed must be resolved (non-negative) before calling this function.
     AceRequest rr = reqs[0];
 
-    if (rr.caption.empty() && rr.lego.empty()) {
-        fprintf(stderr, "[Request] ERROR: caption is empty, skipping\n");
-        return -1;
-    }
-
-    // Lego mode validation (base model only, requires --src-audio)
+    // Lego mode validation (base model only, requires source audio)
     bool is_lego = !rr.lego.empty();
     if (is_lego) {
         if (!have_cover) {
-            fprintf(stderr, "[Lego] ERROR: lego requires --src-audio\n");
+            fprintf(stderr, "[Lego] ERROR: lego requires source audio\n");
             return -1;
         }
         if (ctx->is_turbo) {
@@ -407,14 +398,14 @@ int ace_synth_generate(AceSynth *         ctx,
         return -1;
     }
 
-    // Repaint mode: resolve start/end, requires --src-audio
+    // Repaint mode: resolve start/end, requires source audio
     // Both -1 = inactive. One or both >= 0 activates repaint.
     bool  is_repaint = false;
     float rs         = rr.repainting_start;
     float re         = rr.repainting_end;
     if (rs >= 0.0f || re >= 0.0f) {
         if (!have_cover) {
-            fprintf(stderr, "[Repaint] ERROR: repainting_start/end require --src-audio\n");
+            fprintf(stderr, "[Repaint] ERROR: repainting_start/end require source audio\n");
             return -1;
         }
         float src_dur = (float) T_cover * 1920.0f / 48000.0f;

@@ -232,9 +232,9 @@ int ace_understand_generate(AceUnderstand *    ctx,
     std::vector<int> codes;
 
     // Step 1: get audio codes
-    // --src-audio: full pipeline (VAE encode + FSQ tokenize)
-    // --request without --src-audio: parse audio_codes from JSON
-    // --request + --src-audio: audio from file, params from JSON
+    // src_audio provided: full pipeline (VAE encode + FSQ tokenize)
+    // no src_audio, audio_codes in request: parse from JSON
+    // src_audio + request: audio from caller, params from JSON
     if (src_audio && src_len > 0) {
         if (!ctx->have_vae_enc || !ctx->have_fsq) {
             fprintf(stderr, "[Understand] ERROR: audio input requires VAE + DiT models\n");
@@ -267,7 +267,7 @@ int ace_understand_generate(AceUnderstand *    ctx,
         codes.resize(T_5Hz);
         fprintf(stderr, "[Tok] %d codes (%.2fs @ 5Hz), %.0fms\n", T_5Hz, (float) T_5Hz / 5.0f, t_tok.ms());
 
-        // --dump: save latents and codes for test-tok-cossim.py
+        // dump: save latents and codes for test-tok-cossim.py
         if (ctx->params.dump_dir) {
             DebugDumper dbg;
             debug_init(&dbg, ctx->params.dump_dir);
@@ -291,7 +291,7 @@ int ace_understand_generate(AceUnderstand *    ctx,
         fprintf(stderr, "[Request] %zu codes from request\n", codes.size());
     }
 
-    // --dump without --lm: tok-only mode, skip LM
+    // dump-only mode (no LM loaded): return codes and exit
     if (!ctx->have_lm) {
         request_init(out);
         std::string codes_str;
