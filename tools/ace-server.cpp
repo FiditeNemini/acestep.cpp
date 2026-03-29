@@ -1,22 +1,23 @@
 // ace-server.cpp - HTTP server for ACE-Step music generation
 //
 // Single binary, three endpoints (POST /lm, POST /synth, POST /understand),
-// one port. Models loaded at boot based on which options are provided:
+// one port. Models are discovered by scanning --models directory at startup
+// (GGUF headers only, zero GPU). Load-on-demand: models are loaded into
+// VRAM on first request and swapped when the JSON request specifies a
+// different "synth_model", "lm_model", or "lora".
 //
-//   --lm                          -> enables /lm + /understand
-//   --embedding + --dit + --vae   -> enables /synth
+// Available models are classified by their GGUF general.architecture:
+//   acestep-lm       -> lm bucket     (enables /lm + /understand)
+//   acestep-dit      -> dit bucket    (enables /synth, with text-encoder + vae)
+//   acestep-text-enc -> text-enc bucket (singleton, first entry used)
+//   acestep-vae      -> vae bucket      (singleton, first entry used)
 //
-// At least one complete group required. Endpoints for missing groups return
-// 501. When both are loaded, /synth runs on its own mutex so it can
-// overlap with /lm on the GPU (disjoint models). /lm and /understand always
-// share mtx_lm (same Qwen3 KV cache). When only one group is loaded,
-// everything is serial on mtx_lm.
-//
-// The understand pipeline shares the Qwen3 LM from pipeline-lm to save
-// ~5GB VRAM. Audio input mode (/understand with WAV/MP3) additionally
-// needs DiT + VAE from the synth pipeline for FSQ tokenization.
+// When both LM and synth are loaded, /synth runs on its own mutex so it
+// can overlap with /lm on the GPU. /lm and /understand share mtx_lm
+// (same Qwen3 KV cache).
 
 #include "audio-io.h"
+#include "model-registry.h"
 #include "pipeline-lm.h"
 #include "pipeline-synth.h"
 #include "pipeline-understand.h"
@@ -37,8 +38,6 @@
 #    pragma GCC diagnostic pop
 #endif
 
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -122,36 +121,33 @@ static void on_signal(int) {
 
 // pipeline mutexes.
 // /lm and /understand always lock mtx_lm (shared Qwen3 KV cache).
-// /synth locks mtx_synth when both pipelines are configured (disjoint GPU mem,
-// safe to overlap). when synth is the only pipeline, it uses mtx_lm
-// (no contention anyway, keeps things simple).
+// /synth locks mtx_synth when both pipelines are available (disjoint GPU mem,
+// safe to overlap). when synth is the only pipeline, it uses mtx_lm.
 static std::mutex mtx_lm;
 static std::mutex mtx_synth;
 
-// pipeline contexts. NULL when the corresponding pipeline was not loaded.
+// pipeline contexts. NULL when not loaded.
 static AceLm *         g_ctx_lm         = nullptr;
 static AceSynth *      g_ctx_synth      = nullptr;
 static AceUnderstand * g_ctx_understand = nullptr;
 
-// limits
-static int g_max_batch = 1;
-static int g_mp3_kbps  = 128;
+// model registry (populated at startup, zero GPU)
+static ModelRegistry g_registry;
 
-// sleep/wake: unload models after N seconds of inactivity.
-// wake reloads from disk on next request. 0 = disabled (always loaded).
-static int  g_sleep_sec  = 0;
-static bool g_have_lm    = false;
-static bool g_have_synth = false;
+// loaded model names (empty = nothing loaded)
+static std::string g_loaded_lm;
+static std::string g_loaded_dit;
+static std::string g_loaded_lora;
+static float       g_loaded_lora_scale = 1.0f;
 
-static std::chrono::steady_clock::time_point g_lm_last_use;
-static std::chrono::steady_clock::time_point g_synth_last_use;
-
-// params stored globally for reload on wake
+// pipeline params (rebuilt from registry paths on each load)
 static AceLmParams         g_lm_params;
 static AceSynthParams      g_synth_params;
 static AceUnderstandParams g_und_params;
 
-static std::atomic<bool> g_stop_watchdog{ false };
+// limits
+static int g_max_batch = 1;
+static int g_mp3_kbps  = 128;
 
 // log capture: intercept stderr via pipe, forward to terminal + ring buffer.
 // SSE clients connect to /logs and receive lines in real time.
@@ -301,95 +297,191 @@ static void json_busy(httplib::Response & res) {
     res.set_content("{\"error\":\"Server busy\"}", "application/json");
 }
 
-// sleep/wake helpers. always called under the appropriate mutex.
-// wake reloads from disk. if reload fails, the process exits (crash-restart
-// is simpler and safer than a half-loaded server).
-
-static void wake_lm(void) {
-    fprintf(stderr, "[Server] Loading LM models...\n");
-    g_ctx_lm = ace_lm_load(&g_lm_params);
-    if (!g_ctx_lm) {
-        fprintf(stderr, "[Server] FATAL: LM reload failed, exiting\n");
-        exit(1);
+// resolve model name: explicit request > already loaded > first in bucket
+static std::string resolve_name(const std::vector<ModelEntry> & bucket,
+                                const std::string &             requested,
+                                const std::string &             loaded) {
+    if (!requested.empty()) {
+        return requested;
     }
-    g_und_params.shared_model = ace_lm_get_model(g_ctx_lm);
-    g_und_params.shared_bpe   = ace_lm_get_bpe(g_ctx_lm);
-    g_ctx_understand          = ace_understand_load(&g_und_params);
-    if (!g_ctx_understand) {
-        fprintf(stderr, "[Server] FATAL: understand reload failed, exiting\n");
-        exit(1);
+    if (!loaded.empty()) {
+        return loaded;
     }
-    g_lm_last_use = std::chrono::steady_clock::now();
+    if (!bucket.empty()) {
+        return bucket[0].name;
+    }
+    return "";
 }
 
-static void sleep_lm(void) {
-    fprintf(stderr, "[Server] Unloading LM models\n");
+// server-side routing fields parsed from JSON (not part of AceRequest)
+struct ServerFields {
+    std::string synth_model;
+    std::string lm_model;
+    std::string lora;
+    float       lora_scale;
+};
+
+static void parse_server_fields(const char * json, ServerFields * sf) {
+    sf->synth_model = "";
+    sf->lm_model    = "";
+    sf->lora        = "";
+    sf->lora_scale  = 1.0f;
+
+    yyjson_doc * doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return;
+    }
+    yyjson_val * root = yyjson_doc_get_root(doc);
+    if (!root) {
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    // for arrays, take server fields from the first element
+    yyjson_val * obj = root;
+    if (yyjson_is_arr(root)) {
+        obj = yyjson_arr_get_first(root);
+    }
+    if (!obj || !yyjson_is_obj(obj)) {
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val * v;
+    if ((v = yyjson_obj_get(obj, "synth_model")) && yyjson_is_str(v)) {
+        sf->synth_model = yyjson_get_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lm_model")) && yyjson_is_str(v)) {
+        sf->lm_model = yyjson_get_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lora")) && yyjson_is_str(v)) {
+        sf->lora = yyjson_get_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lora_scale")) && yyjson_is_num(v)) {
+        sf->lora_scale = (float) yyjson_get_num(v);
+    }
+
+    yyjson_doc_free(doc);
+}
+
+// load-on-demand: load LM + understand if name differs from current.
+// called under mtx_lm. returns false on failure (caller should 500).
+static bool ensure_lm(const std::string & name) {
+    if (g_ctx_lm && g_loaded_lm == name) {
+        return true;
+    }
+
+    const ModelEntry * entry = registry_find(g_registry.lm, name.c_str());
+    if (!entry) {
+        fprintf(stderr, "[Server] LM not found: %s\n", name.c_str());
+        return false;
+    }
+
+    // unload old
     ace_understand_free(g_ctx_understand);
     g_ctx_understand = nullptr;
     ace_lm_free(g_ctx_lm);
     g_ctx_lm = nullptr;
-}
 
-static void wake_synth(void) {
-    fprintf(stderr, "[Server] Loading synth models...\n");
-    g_ctx_synth = ace_synth_load(&g_synth_params);
-    if (!g_ctx_synth) {
-        fprintf(stderr, "[Server] FATAL: synth reload failed, exiting\n");
-        exit(1);
+    // load new
+    fprintf(stderr, "[Server] Loading LM: %s\n", name.c_str());
+    g_lm_params.model_path = entry->path.c_str();
+    g_ctx_lm               = ace_lm_load(&g_lm_params);
+    if (!g_ctx_lm) {
+        fprintf(stderr, "[Server] FATAL: LM load failed\n");
+        g_loaded_lm.clear();
+        return false;
     }
-    g_synth_last_use = std::chrono::steady_clock::now();
+
+    // rebuild understand with shared LM
+    g_und_params.shared_model = ace_lm_get_model(g_ctx_lm);
+    g_und_params.shared_bpe   = ace_lm_get_bpe(g_ctx_lm);
+    g_ctx_understand          = ace_understand_load(&g_und_params);
+    if (!g_ctx_understand) {
+        fprintf(stderr, "[Server] FATAL: understand load failed\n");
+        ace_lm_free(g_ctx_lm);
+        g_ctx_lm = nullptr;
+        g_loaded_lm.clear();
+        return false;
+    }
+
+    g_loaded_lm = name;
+    return true;
 }
 
-static void sleep_synth(void) {
-    fprintf(stderr, "[Server] Unloading synth models\n");
+// load-on-demand: load synth pipeline if DiT/LoRA config differs.
+// called under the appropriate synth mutex. returns false on failure.
+static bool ensure_synth(const std::string & dit_name, const std::string & lora_name, float lora_scale) {
+    if (g_ctx_synth && g_loaded_dit == dit_name && g_loaded_lora == lora_name && g_loaded_lora_scale == lora_scale) {
+        return true;
+    }
+
+    // need text-encoder + vae singletons
+    if (g_registry.text_enc.empty() || g_registry.vae.empty()) {
+        fprintf(stderr, "[Server] Missing Text-Enc or VAE in registry\n");
+        return false;
+    }
+
+    const ModelEntry * dit = registry_find(g_registry.dit, dit_name.c_str());
+    if (!dit) {
+        fprintf(stderr, "[Server] DiT not found: %s\n", dit_name.c_str());
+        return false;
+    }
+
+    // unload old
     ace_synth_free(g_ctx_synth);
     g_ctx_synth = nullptr;
-}
 
-static void watchdog_thread(void) {
-    while (!g_stop_watchdog.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (g_sleep_sec < 0) {
-            continue;
+    // set paths
+    g_synth_params.text_encoder_path = g_registry.text_enc[0].path.c_str();
+    g_synth_params.dit_path          = dit->path.c_str();
+    g_synth_params.vae_path          = g_registry.vae[0].path.c_str();
+
+    // resolve lora
+    if (!lora_name.empty()) {
+        const LoraEntry * lora = registry_find_lora(g_registry, lora_name.c_str());
+        if (!lora) {
+            fprintf(stderr, "[Server] LoRA not found: %s\n", lora_name.c_str());
+            g_loaded_dit.clear();
+            g_loaded_lora.clear();
+            return false;
         }
-
-        auto now = std::chrono::steady_clock::now();
-
-        // try to sleep LM group
-        if (g_have_lm && g_ctx_lm) {
-            std::unique_lock<std::mutex> lock(mtx_lm, std::try_to_lock);
-            if (lock.owns_lock() && g_ctx_lm) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_lm_last_use).count();
-                if (elapsed >= g_sleep_sec) {
-                    sleep_lm();
-                }
-            }
-        }
-
-        // try to sleep synth group
-        if (g_have_synth && g_ctx_synth) {
-            std::mutex &                 mtx = g_have_lm ? mtx_synth : mtx_lm;
-            std::unique_lock<std::mutex> lock(mtx, std::try_to_lock);
-            if (lock.owns_lock() && g_ctx_synth) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_synth_last_use).count();
-                if (elapsed >= g_sleep_sec) {
-                    sleep_synth();
-                }
-            }
-        }
+        g_synth_params.lora_path  = lora->path.c_str();
+        g_synth_params.lora_scale = lora_scale;
+    } else {
+        g_synth_params.lora_path  = nullptr;
+        g_synth_params.lora_scale = 1.0f;
     }
+
+    fprintf(stderr, "[Server] Loading synth: DiT=%s%s%s\n", dit_name.c_str(),
+            lora_name.empty() ? "" : " LoRA=", lora_name.c_str());
+    g_ctx_synth = ace_synth_load(&g_synth_params);
+    if (!g_ctx_synth) {
+        fprintf(stderr, "[Server] FATAL: synth load failed\n");
+        g_loaded_dit.clear();
+        g_loaded_lora.clear();
+        return false;
+    }
+
+    g_loaded_dit        = dit_name;
+    g_loaded_lora       = lora_name;
+    g_loaded_lora_scale = lora_scale;
+    return true;
 }
 
 // POST /lm
-// accepts: AceRequest JSON
+// accepts: AceRequest JSON (+ optional "lm_model" for LM selection)
 // returns: JSON array of enriched AceRequests (lm_batch_size controls count)
 static void handle_lm(const httplib::Request & req, httplib::Response & res) {
-    if (!g_have_lm) {
-        json_error(res, 501, "LM pipeline not loaded (requires --lm)");
+    if (g_registry.lm.empty()) {
+        json_error(res, 501, "No LM models in registry");
         return;
     }
 
-    // parse the incoming JSON body
+    // parse server fields + request
+    ServerFields sf;
+    parse_server_fields(req.body.c_str(), &sf);
+
     AceRequest ace_req;
     if (!request_parse_json(&ace_req, req.body.c_str())) {
         json_error(res, 400, "Invalid JSON");
@@ -415,14 +507,17 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
         json_busy(res);
         return;
     }
-    if (!g_ctx_lm) {
-        wake_lm();
+
+    // load-on-demand
+    std::string lm_name = resolve_name(g_registry.lm, sf.lm_model, g_loaded_lm);
+    if (!ensure_lm(lm_name)) {
+        json_error(res, 500, "Failed to load LM");
+        return;
     }
 
     std::vector<AceRequest> out(lm_batch_size);
-    int rc        = ace_lm_generate(g_ctx_lm, &ace_req, lm_batch_size, out.data(), NULL, NULL, server_cancel,
-                                    (void *) &req.is_connection_closed);
-    g_lm_last_use = std::chrono::steady_clock::now();
+    int rc = ace_lm_generate(g_ctx_lm, &ace_req, lm_batch_size, out.data(), NULL, NULL, server_cancel,
+                             (void *) &req.is_connection_closed);
     lock.unlock();
 
     if (rc != 0) {
@@ -455,10 +550,13 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
-    if (!g_have_synth) {
-        json_error(res, 501, "Synth pipeline not loaded (requires --embedding --dit --vae)");
+    if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
+        json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
         return;
     }
+
+    // parse server fields from JSON body (before multipart parsing)
+    ServerFields sf;
 
     // parse request: plain JSON (single or array) or multipart (JSON + audio file)
     std::vector<AceRequest> ace_reqs;
@@ -478,6 +576,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
             json_error(res, 400, "Multipart: missing 'request' part");
             return;
         }
+        parse_server_fields(json_body.c_str(), &sf);
         if (!request_parse_json(&ace_req, json_body.c_str())) {
             json_error(res, 400, "Multipart: invalid JSON in 'request' part");
             return;
@@ -503,6 +602,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         ace_reqs.push_back(ace_req);
     } else {
         // plain JSON body: single object {} or array [{}, ...]
+        parse_server_fields(req.body.c_str(), &sf);
         if (!request_parse_json_array(req.body.c_str(), &ace_reqs)) {
             json_error(res, 400, "Invalid JSON");
             return;
@@ -532,17 +632,22 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     std::vector<AceAudio> audio(total_alloc);
     int                   audio_idx = 0;
 
-    // synth gets its own mutex when LM is also configured (disjoint GPU mem).
+    // synth gets its own mutex when LM is also available (disjoint GPU mem).
     // try_lock: 503 instantly if GPU busy. held for all groups.
-    std::mutex &                 mtx = g_have_lm ? mtx_synth : mtx_lm;
+    std::mutex &                 mtx = g_registry.lm.empty() ? mtx_lm : mtx_synth;
     std::unique_lock<std::mutex> lock(mtx, std::try_to_lock);
     if (!lock.owns_lock()) {
         free(src_interleaved);
         json_busy(res);
         return;
     }
-    if (!g_ctx_synth) {
-        wake_synth();
+
+    // load-on-demand: resolve DiT + LoRA
+    std::string dit_name = resolve_name(g_registry.dit, sf.synth_model, g_loaded_dit);
+    if (!ensure_synth(dit_name, sf.lora, sf.lora_scale)) {
+        free(src_interleaved);
+        json_error(res, 500, "Failed to load synth pipeline");
+        return;
     }
 
     for (int ri = 0; ri < batch_n; ri++) {
@@ -571,7 +676,6 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
                                     server_cancel, (void *) &req.is_connection_closed);
 
         if (rc != 0) {
-            g_synth_last_use = std::chrono::steady_clock::now();
             lock.unlock();
             free(src_interleaved);
             for (int j = 0; j < audio_idx; j++) {
@@ -588,7 +692,6 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
             audio[audio_idx++] = group_audio[i];
         }
     }
-    g_synth_last_use = std::chrono::steady_clock::now();
     lock.unlock();
     free(src_interleaved);
     int total_tracks = audio_idx;
@@ -650,8 +753,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
 //   application/json body        -> codes-only (audio_codes in JSON, skip VAE+FSQ)
 // returns: application/json AceRequest with metadata + lyrics + codes
 static void handle_understand(const httplib::Request & req, httplib::Response & res) {
-    if (!g_have_lm) {
-        json_error(res, 501, "Understand pipeline not loaded (requires --lm)");
+    if (g_registry.lm.empty()) {
+        json_error(res, 501, "No LM models in registry");
         return;
     }
 
@@ -718,14 +821,18 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
         json_busy(res);
         return;
     }
-    if (!g_ctx_lm) {
-        wake_lm();
+
+    // load-on-demand
+    std::string lm_name = resolve_name(g_registry.lm, "", g_loaded_lm);
+    if (!ensure_lm(lm_name)) {
+        free(src_interleaved);
+        json_error(res, 500, "Failed to load LM");
+        return;
     }
 
     AceRequest out;
     int        rc = ace_understand_generate(g_ctx_understand, src_interleaved, src_len, &ace_req, &out, server_cancel,
                                             (void *) &req.is_connection_closed);
-    g_lm_last_use = std::chrono::steady_clock::now();
     lock.unlock();
     free(src_interleaved);
 
@@ -738,47 +845,42 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
 }
 
 // GET /props
-// server configuration, pipeline status, and default request.
-// used by the webui at boot to populate placeholders and status indicators.
+// server configuration, available models, loaded state, and default request.
+// used by the webui at boot to populate dropdowns and status indicators.
 static void handle_props(const httplib::Request &, httplib::Response & res) {
-    // pipeline status: "ok" = loaded, "sleeping" = unloaded, "disabled" = not configured
-    auto pipeline_status = [](bool configured, void * ctx) -> const char * {
-        if (!configured) {
-            return "disabled";
-        }
-        return ctx ? "ok" : "sleeping";
-    };
-
     yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
     yyjson_mut_val * root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
 
-    // helper: add a string field, using "" for NULL pointers (CLI paths)
-    auto add_str = [&](yyjson_mut_val * obj, const char * key, const char * val) {
-        yyjson_mut_obj_add_str(doc, obj, key, val ? val : "");
+    // helper: build a JSON array of model entry names
+    auto add_names = [&](yyjson_mut_val * parent, const char * key, const std::vector<ModelEntry> & bucket) {
+        yyjson_mut_val * arr = yyjson_mut_arr(doc);
+        for (const auto & e : bucket) {
+            yyjson_mut_arr_add_str(doc, arr, e.name.c_str());
+        }
+        yyjson_mut_obj_add_val(doc, parent, key, arr);
     };
 
-    // status
-    yyjson_mut_val * status = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_val(doc, root, "status", status);
-    yyjson_mut_obj_add_str(doc, status, "lm", pipeline_status(g_have_lm, g_ctx_lm));
-    yyjson_mut_obj_add_str(doc, status, "synth", pipeline_status(g_have_synth, g_ctx_synth));
+    // models: available model names per bucket
+    yyjson_mut_val * models = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, root, "models", models);
+    add_names(models, "lm", g_registry.lm);
+    add_names(models, "embedding", g_registry.text_enc);
+    add_names(models, "dit", g_registry.dit);
+    add_names(models, "vae", g_registry.vae);
 
-    // cli: reflects the actual CLI arguments passed to this process
+    // loras: available lora names
+    yyjson_mut_val * loras_arr = yyjson_mut_arr(doc);
+    for (const auto & e : g_registry.loras) {
+        yyjson_mut_arr_add_str(doc, loras_arr, e.name.c_str());
+    }
+    yyjson_mut_obj_add_val(doc, root, "loras", loras_arr);
+
+    // cli: server settings
     yyjson_mut_val * cli = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, root, "cli", cli);
-    add_str(cli, "lm", g_lm_params.model_path);
-    add_str(cli, "embedding", g_synth_params.text_encoder_path);
-    add_str(cli, "dit", g_synth_params.dit_path);
-    add_str(cli, "vae", g_synth_params.vae_path);
-    add_str(cli, "lora", g_synth_params.lora_path);
-    yyjson_mut_obj_add_real(doc, cli, "lora_scale", g_synth_params.lora_scale);
-    yyjson_mut_obj_add_int(doc, cli, "max_seq", g_lm_params.max_seq);
     yyjson_mut_obj_add_int(doc, cli, "max_batch", g_max_batch);
     yyjson_mut_obj_add_int(doc, cli, "mp3_bitrate", g_mp3_kbps);
-    yyjson_mut_obj_add_int(doc, cli, "vae_chunk", g_synth_params.vae_chunk);
-    yyjson_mut_obj_add_int(doc, cli, "vae_overlap", g_synth_params.vae_overlap);
-    yyjson_mut_obj_add_int(doc, cli, "sleep", g_sleep_sec);
 
     // default: full AceRequest with all defaults from request_init().
     // the webui reads this to populate placeholders.
@@ -800,20 +902,13 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
 
 static void usage(const char * prog) {
     fprintf(stderr,
-            "Usage: %s [options]\n"
+            "Usage: %s --models <dir> [options]\n"
             "\n"
-            "LM (enables /lm + /understand):\n"
-            "  --lm <gguf>             Qwen3 LM GGUF file\n"
-            "  --max-seq <N>           KV cache size (default: 8192)\n"
-            "\n"
-            "Synth (enables /synth, all three required):\n"
-            "  --embedding <gguf>      Text encoder GGUF file\n"
-            "  --dit <gguf>            DiT GGUF file\n"
-            "  --vae <gguf>            VAE GGUF file\n"
+            "Required:\n"
+            "  --models <dir>          Directory of GGUF model files\n"
             "\n"
             "LoRA:\n"
-            "  --lora <path>           LoRA safetensors file or directory\n"
-            "  --lora-scale <float>    LoRA scaling factor (default: 1.0)\n"
+            "  --loras <dir>           Directory of LoRA adapters\n"
             "\n"
             "VAE tiling (memory control):\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
@@ -826,7 +921,7 @@ static void usage(const char * prog) {
             "  --host <addr>           Listen address (default: 127.0.0.1)\n"
             "  --port <N>              Listen port (default: 8080)\n"
             "  --max-batch <N>         LM batch limit (default: 1)\n"
-            "  --sleep <N>             Unload after N sec. 0=instant (default), -1=off\n"
+            "  --max-seq <N>           KV cache size (default: 8192)\n"
             "\n"
             "Debug:\n"
             "  --no-fsm                Disable FSM constrained decoding\n"
@@ -842,8 +937,10 @@ int main(int argc, char ** argv) {
     ace_lm_default_params(&g_lm_params);
     ace_synth_default_params(&g_synth_params);
 
-    const char * host = "127.0.0.1";
-    int          port = 8080;
+    const char * host       = "127.0.0.1";
+    int          port       = 8080;
+    const char * models_dir = nullptr;
+    const char * loras_dir  = nullptr;
 
     if (argc < 2) {
         usage(argv[0]);
@@ -851,25 +948,12 @@ int main(int argc, char ** argv) {
     }
 
     for (int i = 1; i < argc; i++) {
-        // LM
-        if (!strcmp(argv[i], "--lm") && i + 1 < argc) {
-            g_lm_params.model_path = argv[++i];
+        if (!strcmp(argv[i], "--models") && i + 1 < argc) {
+            models_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--loras") && i + 1 < argc) {
+            loras_dir = argv[++i];
         } else if (!strcmp(argv[i], "--max-seq") && i + 1 < argc) {
             g_lm_params.max_seq = atoi(argv[++i]);
-
-            // synth models
-        } else if (!strcmp(argv[i], "--embedding") && i + 1 < argc) {
-            g_synth_params.text_encoder_path = argv[++i];
-        } else if (!strcmp(argv[i], "--dit") && i + 1 < argc) {
-            g_synth_params.dit_path = argv[++i];
-        } else if (!strcmp(argv[i], "--vae") && i + 1 < argc) {
-            g_synth_params.vae_path = argv[++i];
-
-            // lora
-        } else if (!strcmp(argv[i], "--lora") && i + 1 < argc) {
-            g_synth_params.lora_path = argv[++i];
-        } else if (!strcmp(argv[i], "--lora-scale") && i + 1 < argc) {
-            g_synth_params.lora_scale = (float) atof(argv[++i]);
 
             // vae tiling
         } else if (!strcmp(argv[i], "--vae-chunk") && i + 1 < argc) {
@@ -888,8 +972,6 @@ int main(int argc, char ** argv) {
             port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--max-batch") && i + 1 < argc) {
             g_max_batch = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--sleep") && i + 1 < argc) {
-            g_sleep_sec = atoi(argv[++i]);
 
             // debug
         } else if (!strcmp(argv[i], "--no-fsm")) {
@@ -913,21 +995,33 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // at least --lm or the synth trio is required.
-    // synth needs all three: --embedding + --dit + --vae.
-    g_have_lm = (g_lm_params.model_path != NULL);
-
-    bool have_any_synth = (g_synth_params.text_encoder_path || g_synth_params.dit_path || g_synth_params.vae_path);
-    g_have_synth        = (g_synth_params.text_encoder_path && g_synth_params.dit_path && g_synth_params.vae_path);
-
-    if (have_any_synth && !g_have_synth) {
-        fprintf(stderr, "[Server] ERROR: incomplete synth options\n");
-        fprintf(stderr, "  synth requires all three: --embedding --dit --vae\n");
+    // --models is required
+    if (!models_dir) {
+        fprintf(stderr, "[Server] ERROR: --models is required\n");
+        usage(argv[0]);
         return 1;
     }
-    if (!g_have_lm && !g_have_synth) {
-        fprintf(stderr, "[Server] ERROR: no models provided\n");
-        usage(argv[0]);
+
+    // scan models directory (header-only, zero GPU)
+    fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
+    if (!registry_scan(&g_registry, models_dir)) {
+        fprintf(stderr, "[Server] ERROR: no GGUF models found in %s\n", models_dir);
+        return 1;
+    }
+
+    // scan loras directory (optional)
+    if (loras_dir) {
+        fprintf(stderr, "[Server] Scanning LoRAs in %s\n", loras_dir);
+        registry_scan_loras(&g_registry, loras_dir);
+    }
+
+    // need at least one usable pipeline
+    bool have_lm    = !g_registry.lm.empty();
+    bool have_synth = !g_registry.dit.empty() && !g_registry.text_enc.empty() && !g_registry.vae.empty();
+    if (!have_lm && !have_synth) {
+        fprintf(stderr, "[Server] ERROR: no usable pipeline\n");
+        fprintf(stderr, "  /lm requires:    at least one acestep-lm GGUF\n");
+        fprintf(stderr, "  /synth requires: at least one acestep-dit + one acestep-text-enc + one acestep-vae\n");
         return 1;
     }
 
@@ -938,64 +1032,15 @@ int main(int argc, char ** argv) {
     if (g_max_batch > 9) {
         g_max_batch = 9;
     }
-
-    // always set max_batch so wake_lm() picks it up
     g_lm_params.max_batch = g_max_batch;
 
-    // always init understand params so wake_lm() can reload it.
-    // dit_path/vae_path are NULL when synth not configured (codes-only mode).
-    if (g_have_lm) {
-        ace_understand_default_params(&g_und_params);
-        g_und_params.dit_path = g_synth_params.dit_path;
-        g_und_params.vae_path = g_synth_params.vae_path;
-        g_und_params.use_fa   = g_lm_params.use_fa;
-        g_und_params.use_fsm  = g_lm_params.use_fsm;
-    }
-
-    // when --sleep is set (>= 0), skip initial load. models load on first request
-    // and unload after idle timeout. with --sleep 0 (default), pipelines unload
-    // immediately after use, so LM and synth never coexist in memory.
-    // --sleep -1 disables sleep (all models stay loaded).
-    if (g_sleep_sec >= 0) {
-        fprintf(stderr, "[Server] Lazy mode: models will load on first request\n");
-    } else {
-        // load everything at startup
-
-        // load LM pipeline (optional)
-        if (g_have_lm) {
-            fprintf(stderr, "[Server] Loading LM (max_batch=%d, max_seq=%d)...\n", g_max_batch, g_lm_params.max_seq);
-            g_ctx_lm = ace_lm_load(&g_lm_params);
-            if (!g_ctx_lm) {
-                fprintf(stderr, "[Server] FATAL: LM load failed\n");
-                return 1;
-            }
-        }
-
-        // load synth pipeline (optional)
-        if (g_have_synth) {
-            fprintf(stderr, "[Server] Loading synth...\n");
-            g_ctx_synth = ace_synth_load(&g_synth_params);
-            if (!g_ctx_synth) {
-                fprintf(stderr, "[Server] FATAL: synth load failed\n");
-                ace_lm_free(g_ctx_lm);
-                return 1;
-            }
-        }
-
-        // load understand pipeline when LM is available.
-        // shares the Qwen3 model from pipeline-lm to save ~5GB VRAM.
-        if (g_ctx_lm) {
-            g_und_params.shared_model = ace_lm_get_model(g_ctx_lm);
-            g_und_params.shared_bpe   = ace_lm_get_bpe(g_ctx_lm);
-            fprintf(stderr, "[Server] Loading understand%s...\n", g_have_synth ? " (audio + codes)" : " (codes-only)");
-            g_ctx_understand = ace_understand_load(&g_und_params);
-            if (!g_ctx_understand) {
-                fprintf(stderr, "[Server] FATAL: understand load failed\n");
-                ace_synth_free(g_ctx_synth);
-                ace_lm_free(g_ctx_lm);
-                return 1;
-            }
-        }
+    // init understand params (dit/vae paths set lazily in ensure_lm when synth is available)
+    ace_understand_default_params(&g_und_params);
+    g_und_params.use_fa  = g_lm_params.use_fa;
+    g_und_params.use_fsm = g_lm_params.use_fsm;
+    if (have_synth) {
+        g_und_params.dit_path = g_registry.dit[0].path.c_str();
+        g_und_params.vae_path = g_registry.vae[0].path.c_str();
     }
 
     // setup HTTP server
@@ -1017,7 +1062,7 @@ int main(int argc, char ** argv) {
     svr.set_payload_max_length(120 * 1024 * 1024);
 
     // all endpoints are always registered. handlers return 501 when the
-    // backing pipeline was not configured.
+    // backing pipeline has no models in the registry.
     svr.Post("/lm", handle_lm);
     svr.Post("/synth", handle_synth);
     svr.Post("/understand", handle_understand);
@@ -1046,29 +1091,17 @@ int main(int argc, char ** argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    // start watchdog thread for sleep/wake
-    std::thread watchdog;
-    if (g_sleep_sec >= 0) {
-        g_lm_last_use    = std::chrono::steady_clock::now();
-        g_synth_last_use = std::chrono::steady_clock::now();
-        watchdog         = std::thread(watchdog_thread);
-    }
-
     fprintf(stderr, "[Server] Listening on %s:%d\n", host, port);
-    fprintf(stderr, "[Server] Pipelines:%s%s%s\n", g_have_lm ? " /lm" : "", g_have_synth ? " /synth" : "",
-            g_have_lm ? " /understand" : "");
-    fprintf(stderr, "[Server] max_batch=%d mp3_kbps=%d sleep=%ds\n", g_max_batch, g_mp3_kbps, g_sleep_sec);
-
+    fprintf(stderr, "[Server] Pipelines:%s%s%s\n", have_lm ? " /lm" : "", have_synth ? " /synth" : "",
+            have_lm ? " /understand" : "");
+    fprintf(stderr, "[Server] Models: %zu LM, %zu Text-Enc, %zu DiT, %zu VAE, %zu LoRA\n", g_registry.lm.size(),
+            g_registry.text_enc.size(), g_registry.dit.size(), g_registry.vae.size(), g_registry.loras.size());
     if (!svr.listen(host, port)) {
         fprintf(stderr, "[Server] FATAL: cannot bind %s:%d\n", host, port);
     }
 
-    // stop watchdog, then cleanup (all _free functions handle NULL)
+    // cleanup (all _free functions handle NULL)
     fprintf(stderr, "[Server] Shutting down...\n");
-    g_stop_watchdog.store(true, std::memory_order_relaxed);
-    if (watchdog.joinable()) {
-        watchdog.join();
-    }
     ace_understand_free(g_ctx_understand);
     ace_synth_free(g_ctx_synth);
     ace_lm_free(g_ctx_lm);

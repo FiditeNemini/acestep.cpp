@@ -1,4 +1,4 @@
-import type { AceRequest, AceHealth } from './types.js';
+import type { AceRequest, AceProps } from './types.js';
 import { FETCH_TIMEOUT_MS } from './config.js';
 
 // POST lm: partial request -> enriched request(s)
@@ -136,7 +136,7 @@ export async function understandAudio(blob: Blob): Promise<AceRequest> {
 }
 
 // GET props: server config, pipeline status, default request (2s timeout)
-export async function props(): Promise<AceHealth> {
+export async function props(): Promise<AceProps> {
 	const res = await fetch('props', {
 		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
 	});

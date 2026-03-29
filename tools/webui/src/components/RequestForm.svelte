@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { RotateCcw, Download, FolderOpen } from '@lucide/svelte';
-	import { app, toast } from '../lib/state.svelte.js';
+	import { app, toast, setRequest } from '../lib/state.svelte.js';
 	import {
 		lmGenerate,
 		synthGenerate,
@@ -21,8 +21,11 @@
 	let busy = $state(false);
 	let fileInput: HTMLInputElement;
 
-	let d = $derived(app.health?.default);
-	let maxBatch = $derived(Number(app.health?.cli?.max_batch) || 1);
+	let d = $derived(app.props?.default);
+	let maxBatch = $derived(Number(app.props?.cli?.max_batch) || 1);
+	let ditModels = $derived(app.props?.models.dit ?? []);
+	let lmModels = $derived(app.props?.models.lm ?? []);
+	let loraList = $derived(app.props?.loras ?? []);
 	let taskType = $derived(app.request.task_type || '');
 	let needsTrack = $derived(
 		taskType === TASK_LEGO || taskType === TASK_EXTRACT || taskType === TASK_COMPLETE
@@ -39,7 +42,7 @@
 
 	function reset() {
 		app.name = '';
-		app.request = { caption: '' };
+		setRequest({ caption: '' });
 		app.pendingRequests = [];
 		app.pendingIndex = 0;
 	}
@@ -74,7 +77,7 @@
 			file
 				.text()
 				.then((text) => {
-					app.request = JSON.parse(text) as AceRequest;
+					setRequest(JSON.parse(text) as AceRequest);
 					app.name = file.name.replace(/\.json$/i, '') || 'Imported';
 					app.pendingRequests = [];
 					app.pendingIndex = 0;
@@ -106,8 +109,7 @@
 			});
 			const result = await understandAudio(blob);
 
-			// populate form with understood metadata
-			app.request = result;
+			setRequest(result);
 			app.pendingRequests = [];
 			app.pendingIndex = 0;
 
@@ -183,6 +185,11 @@
 		if (synth_batch_size != null && synth_batch_size >= 1) out.synth_batch_size = synth_batch_size;
 		if (r.task_type) out.task_type = String(r.task_type);
 		if (r.track) out.track = String(r.track);
+		if (r.synth_model) out.synth_model = String(r.synth_model);
+		if (r.lm_model) out.lm_model = String(r.lm_model);
+		if (r.lora) out.lora = String(r.lora);
+		const lora_scale = num(r.lora_scale);
+		if (lora_scale != null) out.lora_scale = lora_scale;
 		return out;
 	}
 
@@ -197,7 +204,7 @@
 	// synth params are form-global, not per-pending: preserve them across switches.
 	function loadPending(index: number) {
 		const r = app.pendingRequests[index];
-		app.request = {
+		setRequest({
 			...r,
 			inference_steps: app.request.inference_steps,
 			guidance_scale: app.request.guidance_scale,
@@ -205,7 +212,7 @@
 			seed: app.request.seed,
 			audio_cover_strength: app.request.audio_cover_strength,
 			synth_batch_size: app.request.synth_batch_size
-		};
+		});
 		app.pendingIndex = index;
 	}
 
@@ -230,7 +237,7 @@
 				app.pendingRequests = results;
 				app.pendingIndex = 0;
 				// load LM result but preserve synth params from the form
-				app.request = {
+				setRequest({
 					...results[0],
 					inference_steps: app.request.inference_steps,
 					guidance_scale: app.request.guidance_scale,
@@ -238,7 +245,7 @@
 					seed: app.request.seed,
 					audio_cover_strength: app.request.audio_cover_strength,
 					synth_batch_size: app.request.synth_batch_size
-				};
+				});
 			}
 		} catch (e: unknown) {
 			toast(e instanceof Error ? e.message : String(e));
@@ -275,6 +282,11 @@
 			const t = app.request.task_type || '';
 			if (t) synthParams.task_type = t;
 			if (app.request.track) synthParams.track = app.request.track;
+			// model routing from form
+			if (app.request.synth_model) synthParams.synth_model = app.request.synth_model;
+			if (app.request.lora) synthParams.lora = app.request.lora;
+			const loraScale = num(app.request.lora_scale);
+			if (loraScale != null) synthParams.lora_scale = loraScale;
 			// repaint/complete: inject range when task requires it
 			if (
 				(t === TASK_REPAINT || t === TASK_COMPLETE) &&
@@ -353,6 +365,42 @@
 		<button type="button" onclick={reset} title="Reset prompt"><RotateCcw size={14} /> Reset</button
 		>
 	</div>
+
+	<details>
+		<summary>Models</summary>
+		<div class="details-body">
+			<div class="model-row">
+				<span class="model-label">LM</span>
+				<select bind:value={app.request.lm_model}>
+					{#each lmModels as name}
+						<option value={name}>{name}</option>
+					{/each}
+				</select>
+			</div>
+			<div class="model-row">
+				<span class="model-label">DiT</span>
+				<select bind:value={app.request.synth_model}>
+					{#each ditModels as name}
+						<option value={name}>{name}</option>
+					{/each}
+				</select>
+			</div>
+			<div class="model-row">
+				<span class="model-label">LoRA</span>
+				<select bind:value={app.request.lora}>
+					{#each loraList as name}
+						<option value={name}>{name}</option>
+					{/each}
+				</select>
+				<input
+					type="text"
+					class="batch-input"
+					placeholder="1.0"
+					bind:value={app.request.lora_scale}
+				/>
+			</div>
+		</div>
+	</details>
 
 	<label class="section-label"
 		>Name
@@ -620,7 +668,8 @@
 		font-weight: 600;
 	}
 	textarea,
-	input[type='text'] {
+	input[type='text'],
+	select {
 		font-family: inherit;
 		font-size: 0.9rem;
 		padding: 0.4rem 0.5rem;
@@ -655,6 +704,20 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		padding: 0.25rem 0 0.5rem;
+	}
+	.model-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.model-label {
+		font-size: 0.85rem;
+		color: var(--fg-dim);
+		flex-shrink: 0;
+		width: 2rem;
+	}
+	.model-row select {
+		flex: 1;
 	}
 	.selector-row {
 		display: flex;

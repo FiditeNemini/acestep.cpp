@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Play, Square, Pencil, Download, Trash2 } from '@lucide/svelte';
-	import { app } from '../lib/state.svelte.js';
+	import { app, setRequest } from '../lib/state.svelte.js';
 	import { deleteSong } from '../lib/db.js';
 	import type { Song } from '../lib/types.js';
 	import Waveform from './Waveform.svelte';
@@ -41,7 +41,7 @@
 
 	function load() {
 		app.name = song.name;
-		app.request = { ...song.request };
+		setRequest({ ...song.request });
 		app.pendingRequests = [];
 		app.pendingIndex = 0;
 	}

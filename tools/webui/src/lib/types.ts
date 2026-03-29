@@ -26,14 +26,22 @@ export interface AceRequest {
 	repainting_end?: number;
 	task_type?: string;
 	track?: string;
+	// server routing (not part of C++ AceRequest, parsed separately)
+	synth_model?: string;
+	lm_model?: string;
+	lora?: string;
+	lora_scale?: number;
 }
 
-// GET /health response
-export interface AceHealth {
-	status: {
-		lm: 'ok' | 'sleeping' | 'disabled';
-		synth: 'ok' | 'sleeping' | 'disabled';
+// GET /props response
+export interface AceProps {
+	models: {
+		lm: string[];
+		embedding: string[];
+		dit: string[];
+		vae: string[];
 	};
+	loras: string[];
 	cli: Record<string, string | number>;
 	default: AceRequest;
 }

@@ -1,4 +1,4 @@
-import type { AceRequest, AceHealth, Song } from './types.js';
+import type { AceRequest, AceProps, Song } from './types.js';
 
 const STORAGE_KEY = 'ace';
 
@@ -48,7 +48,7 @@ export const app = $state({
 	logsOpen: saved.logsOpen,
 	request: saved.request as AceRequest,
 	songs: [] as Song[],
-	health: null as AceHealth | null,
+	props: null as AceProps | null,
 	toast: '' as string,
 	pendingRequests: [] as AceRequest[],
 	pendingIndex: 0,
@@ -65,6 +65,16 @@ export function toast(msg: string, ms = 4000) {
 	toastTimer = setTimeout(() => {
 		app.toast = '';
 	}, ms) as unknown as number;
+}
+
+// overwrite app.request, preserving model routing fields unless the
+// incoming request provides them (non-empty string / non-null number).
+export function setRequest(incoming: AceRequest) {
+	if (!incoming.synth_model) incoming.synth_model = app.request.synth_model;
+	if (!incoming.lm_model) incoming.lm_model = app.request.lm_model;
+	if (!incoming.lora) incoming.lora = app.request.lora;
+	if (incoming.lora_scale == null) incoming.lora_scale = app.request.lora_scale;
+	app.request = incoming;
 }
 
 // persist on every change

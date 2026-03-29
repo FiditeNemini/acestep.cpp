@@ -88,12 +88,12 @@ cat > /tmp/request.json << 'EOF'
 EOF
 
 # LLM: request.json -> request0.json (enriched with metadata + lyrics + codes)
-./build/ace-lm \
+./ace-lm \
     --request /tmp/request.json \
     --lm models/acestep-5Hz-lm-4B-Q8_0.gguf
 
 # DiT+VAE: request0.json -> request00.mp3
-./build/ace-synth \
+./ace-synth \
     --request /tmp/request0.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
     --dit models/acestep-v15-turbo-Q8_0.gguf \
@@ -104,7 +104,7 @@ With a LoRA adapter (PEFT directory or ComfyUI single file):
 
 ```bash
 # PEFT directory (contains adapter_model.safetensors + adapter_config.json)
-./build/ace-synth \
+./ace-synth \
     --request /tmp/request0.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
     --dit models/acestep-v15-turbo-Q8_0.gguf \
@@ -112,7 +112,7 @@ With a LoRA adapter (PEFT directory or ComfyUI single file):
     --lora /path/to/lora-adapter
 
 # ComfyUI single .safetensors file (alpha baked in, no config needed)
-./build/ace-synth \
+./ace-synth \
     --request /tmp/request0.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
     --dit models/acestep-v15-turbo-Q8_0.gguf \
@@ -133,12 +133,12 @@ cat > /tmp/request.json << 'EOF'
 EOF
 
 # LM: request.json (lm_batch_size=2) -> request0.json, request1.json
-./build/ace-lm \
+./ace-lm \
     --request /tmp/request.json \
     --lm models/acestep-5Hz-lm-4B-Q8_0.gguf
 
 # DiT+VAE: both requests in one GPU batch -> request00.mp3, request10.mp3
-./build/ace-synth \
+./ace-synth \
     --request /tmp/request0.json /tmp/request1.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
     --dit models/acestep-v15-turbo-Q8_0.gguf \
@@ -163,7 +163,7 @@ cat > /tmp/cover.json << 'EOF'
 }
 EOF
 
-./build/ace-synth \
+./ace-synth \
     --src-audio song.wav \
     --request /tmp/cover.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
@@ -253,7 +253,7 @@ cat > /tmp/repaint.json << 'EOF'
 }
 EOF
 
-./build/ace-synth \
+./ace-synth \
     --src-audio song.wav \
     --request /tmp/repaint.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
@@ -278,7 +278,7 @@ cat > /tmp/lego.json << 'EOF'
 }
 EOF
 
-./build/ace-synth \
+./ace-synth \
     --src-audio backing-track.wav \
     --request /tmp/lego.json \
     --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
@@ -322,7 +322,11 @@ the LLM fills them, or a sensible runtime default is applied.
     "repainting_start":     -1,
     "repainting_end":       -1,
     "task_type":            "",
-    "track":                ""
+    "track":                "",
+    "synth_model":          "",
+    "lm_model":             "",
+    "lora":                 "",
+    "lora_scale":           1.0
 }
 ```
 
@@ -431,6 +435,27 @@ Values: `text2music`, `cover`, `repaint`, `lego`, `extract`, `complete`.
 Track name for `lego`, `extract`, and `complete` modes. Standard names: `vocals`, `backing_vocals`, `drums`,
 `bass`, `guitar`, `keyboard`, `percussion`, `strings`, `synth`, `fx`, `brass`,
 `woodwinds`. Non-standard names produce a warning but are passed through.
+
+### Server model routing (ace-server only)
+
+These fields are parsed by ace-server but are not part of the C++ `AceRequest`
+struct. They select which model to load from the `--models` directory.
+
+**`synth_model`** (string, default `""`)
+DiT model filename to use for /synth (e.g. `"acestep-v15-turbo-Q8_0.gguf"`).
+Empty string keeps the currently loaded DiT, or loads the first available one.
+
+**`lm_model`** (string, default `""`)
+LM model filename to use for /lm and /understand (e.g. `"acestep-5Hz-lm-4B-Q8_0.gguf"`).
+Empty string keeps the currently loaded LM, or loads the first available one.
+
+**`lora`** (string, default `""`)
+LoRA adapter name from the `--loras` directory (e.g. `"singer-v2.safetensors"`
+or `"my-peft-lora"`). Empty string means no LoRA. Changing the LoRA reloads
+the DiT (LoRA is merged into weights at load time).
+
+**`lora_scale`** (float, default `1.0`)
+LoRA scaling factor. Only used when `lora` is set.
 
 ### LM sampling (ace-lm)
 
@@ -563,35 +588,30 @@ in one GPU pass.
 ## ace-server reference
 
 HTTP server exposing the same pipelines as `ace-lm`, `ace-synth`, and
-`ace-understand` over three POST endpoints. Models are loaded once at
-startup. One binary, one port.
+`ace-understand` over three POST endpoints. One binary, one port.
 
-At least `--lm` or the synth trio (`--embedding --dit --vae`) is required.
+`--models` scans a directory for GGUF files and classifies each by its
+`general.architecture` metadata into LM, Text-Enc, DiT, and VAE buckets.
+Models are loaded on demand when a request arrives, and swapped when the
+request JSON specifies a different `synth_model`, `lm_model`, or `lora`.
 
-| Pipeline | Args | Enables | VRAM (approx) |
-|:---------|:-----|:--------|:--------------|
-| LM | `--lm` | /lm, /understand | ~7 GB (batch=1) |
-| Synth | `--embedding --dit --vae` | /synth | ~12 GB |
+| Pipeline | GGUF architectures needed | Enables | VRAM (approx) |
+|:---------|:--------------------------|:--------|:--------------|
+| LM | `acestep-lm` | /lm, /understand | ~7 GB (batch=1) |
+| Synth | `acestep-text-enc` + `acestep-dit` + `acestep-vae` | /synth | ~12 GB |
 
-When both are loaded, all three endpoints are active and /synth runs
-concurrently with /lm (disjoint GPU memory, separate mutexes).
-Endpoints whose pipeline is not loaded return 501.
+When models for both pipelines are present, all three endpoints are active
+and /synth runs concurrently with /lm (disjoint GPU memory, separate mutexes).
+Endpoints whose pipeline has no models in the registry return 501.
 
 ```
-Usage: ace-server [options]
+Usage: ace-server --models <dir> [options]
 
-LM (enables /lm + /understand):
-  --lm <gguf>             Qwen3 LM GGUF file
-  --max-seq <N>           KV cache size (default: 8192)
-
-Synth (enables /synth, all three required):
-  --embedding <gguf>      Text encoder GGUF file
-  --dit <gguf>            DiT GGUF file
-  --vae <gguf>            VAE GGUF file
+Required:
+  --models <dir>          Directory of GGUF model files
 
 LoRA:
-  --lora <path>           LoRA safetensors file or directory
-  --lora-scale <float>    LoRA scaling factor (default: 1.0)
+  --loras <dir>           Directory of LoRA adapters
 
 VAE tiling (memory control):
   --vae-chunk <N>         Latent frames per tile (default: 256)
@@ -604,7 +624,7 @@ Server:
   --host <addr>           Listen address (default: 127.0.0.1)
   --port <N>              Listen port (default: 8080)
   --max-batch <N>         LM batch limit (default: 1)
-  --sleep <N>             Unload after N sec. 0=instant (default), -1=off
+  --max-seq <N>           KV cache size (default: 8192)
 
 Debug:
   --no-fsm                Disable FSM constrained decoding
@@ -616,17 +636,14 @@ Debug:
 Examples:
 
 ```bash
-# all pipelines (default: lazy load, one pipeline at a time)
-ace-server --lm lm.gguf --embedding emb.gguf --dit dit.gguf --vae vae.gguf
+# all models in one directory, load on demand
+./ace-server --models /path/to/models
 
-# all pipelines, always loaded (--sleep -1)
-ace-server --lm lm.gguf --embedding emb.gguf --dit dit.gguf --vae vae.gguf --sleep -1
+# with LoRA adapters
+./ace-server --models /path/to/models --loras /path/to/loras
 
-# synth only (/lm and /understand return 501)
-ace-server --embedding emb.gguf --dit dit.gguf --vae vae.gguf
-
-# LM only (/synth returns 501, /understand codes-only)
-ace-server --lm lm.gguf
+# custom port and batch limit
+./ace-server --models /path/to/models --host 0.0.0.0 --port 8085 --max-batch 2
 ```
 
 ### Endpoints
@@ -634,7 +651,8 @@ ace-server --lm lm.gguf
 **POST /lm** accepts an AceRequest JSON body, runs the LM pipeline, and
 returns a JSON array of enriched requests (`Content-Type: application/json`).
 `lm_batch_size` in the input controls the array length (clamped to `1..max_batch`).
-Requires `--lm`.
+`lm_model` in the JSON selects the LM to load.
+Requires at least one `acestep-lm` GGUF in `--models`.
 
 **POST /synth** runs the synth pipeline and returns audio (MP3 or WAV via `?wav=1`).
 Three input modes: a JSON array `[{req0}, {req1}]` for batch generation,
@@ -648,29 +666,32 @@ Response format depends on batch size:
 batch=1: raw audio body.
 batch>1: `Content-Type: multipart/mixed`, each part is raw audio.
 Metadata (seed, duration, etc) is already in the request JSON from /lm.
-Requires `--embedding --dit --vae`.
+`synth_model`, `lora`, `lora_scale` in the JSON select the DiT and LoRA to load.
+Requires `acestep-text-enc` + `acestep-dit` + `acestep-vae` GGUFs in `--models`.
 
 **POST /understand** runs the reverse pipeline (audio -> metadata + lyrics + codes)
 and returns an AceRequest JSON. Two input modes: `multipart/form-data` with an
 `audio` part (required) and optional `request` part (sampling params), or plain
 `application/json` with `audio_codes` for codes-only mode (skip VAE + FSQ).
-Audio input mode requires `--lm` plus `--dit --vae`. Codes-only mode
-requires just `--lm`.
+Audio input mode requires LM + DiT + VAE. Codes-only mode requires just LM.
 
-**GET /health** returns `{"status":"ok"}`. Zero allocation, zero logic.
-Use for load balancer health checks.
+**GET /health** returns `{"status":"ok"}`.
 
-**GET /props** returns server configuration, pipeline status, and the
-default AceRequest (source of truth for webui placeholders):
+**GET /props** returns available models, server configuration, and the
+default AceRequest (source of truth for webui dropdowns and placeholders):
 ```json
 {
-  "status": { "lm": "ok", "synth": "sleeping" },
-  "cli": { "max_batch": 2, "mp3_bitrate": 128, ... },
+  "models": {
+    "lm": ["acestep-5Hz-lm-0.6B-Q8_0.gguf", "acestep-5Hz-lm-4B-Q8_0.gguf"],
+    "embedding": ["Qwen3-Embedding-0.6B-Q8_0.gguf"],
+    "dit": ["acestep-v15-turbo-Q8_0.gguf", "acestep-v15-base-Q8_0.gguf"],
+    "vae": ["vae-BF16.gguf"]
+  },
+  "loras": [],
+  "cli": { "max_batch": 1, "mp3_bitrate": 128 },
   "default": { "caption": "", "duration": 0, ... }
 }
 ```
-Pipeline status: `"ok"` = loaded, `"sleeping"` = unloaded by `--sleep`
-(will wake on next request), `"disabled"` = not configured.
 
 Error responses are JSON: `{"error":"message"}` with 400, 500, 501, or
 503 status. 503 includes a `Retry-After` header.
@@ -686,12 +707,9 @@ Each handler uses `try_lock`: if the GPU is busy, the client gets an
 instant 503 with `Retry-After`. No request ever blocks waiting for
 another to finish.
 
-`--sleep N` unloads models after N seconds with no requests. The default
-(`--sleep 0`) unloads immediately after each request, so LM and synth
-never coexist in memory. `--sleep -1` disables unloading (all models
-stay loaded). The next request after unloading reloads from disk (a few
-seconds on NVMe). If reload fails, the process exits (let systemd/docker
-restart it).
+When the requested model differs from the one currently loaded, the old
+model is freed and the new one is loaded from disk before processing the
+request. If the load fails, the handler returns 500.
 
 Request bodies are limited to 120 MB (enough for a 10-minute WAV upload
 via multipart).
@@ -750,13 +768,13 @@ on most material).
 
 ```bash
 # encode (Q4: 6.8 kbit/s, ~150 KB for 3 minutes)
-neural-codec --vae models/vae-BF16.gguf --encode --q4 -i song.wav -o song.nac4
+./neural-codec --vae models/vae-BF16.gguf --encode --q4 -i song.wav -o song.nac4
 
 # encode (Q8: 13 kbit/s, ~290 KB for 3 minutes)
-neural-codec --vae models/vae-BF16.gguf --encode --q8 -i song.wav -o song.nac8
+./neural-codec --vae models/vae-BF16.gguf --encode --q8 -i song.wav -o song.nac8
 
 # decode (auto-detects format)
-neural-codec --vae models/vae-BF16.gguf --decode -i song.nac4 -o song_decoded.wav
+./neural-codec --vae models/vae-BF16.gguf --decode -i song.nac4 -o song_decoded.wav
 
 # roundtrip validation: compare song.wav and song_decoded.wav with your ears
 ```

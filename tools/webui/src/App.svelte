@@ -3,7 +3,7 @@
 	import { app } from './lib/state.svelte.js';
 	import { props } from './lib/api.js';
 	import { getAllSongs } from './lib/db.js';
-	import { HEALTH_POLL_MS } from './lib/config.js';
+	import { PROPS_POLL_MS } from './lib/config.js';
 	import RequestForm from './components/RequestForm.svelte';
 	import SongList from './components/SongList.svelte';
 	import Toast from './components/Toast.svelte';
@@ -15,25 +15,22 @@
 			.catch(() => {});
 	});
 
-	// poll /health every HEALTH_POLL_MS, null on failure (grey labels)
+	// poll /props every PROPS_POLL_MS, null on failure (grey badges)
 	function pollProps() {
 		props()
-			.then((h) => (app.health = h))
-			.catch(() => (app.health = null));
+			.then((h) => (app.props = h))
+			.catch(() => (app.props = null));
 	}
 
 	$effect(() => {
 		pollProps();
-		const id = setInterval(pollProps, HEALTH_POLL_MS);
+		const id = setInterval(pollProps, PROPS_POLL_MS);
 		return () => clearInterval(id);
 	});
 
-	function statusClass(status: string | undefined): string {
-		if (!app.health) return 'st-off';
-		if (status === 'ok') return 'st-ok';
-		if (status === 'sleeping') return 'st-sleep';
-		if (status === 'disabled') return 'st-disabled';
-		return 'st-off';
+	function statusClass(hasModels: boolean): string {
+		if (!app.props) return 'st-off';
+		return hasModels ? 'st-ok' : 'st-disabled';
 	}
 
 	function onVolume(e: Event) {
@@ -54,8 +51,8 @@
 		<label class="dark-toggle">
 			<input type="checkbox" bind:checked={app.dark} /> Dark
 		</label>
-		<span class="status-badge {statusClass(app.health?.status.lm)}">LM</span>
-		<span class="status-badge {statusClass(app.health?.status.synth)}">Synth</span>
+		<span class="status-badge {statusClass((app.props?.models.lm.length ?? 0) > 0)}">LM</span>
+		<span class="status-badge {statusClass((app.props?.models.dit.length ?? 0) > 0)}">Synth</span>
 		<div class="volume">
 			<Volume2 size={14} />
 			<input type="range" min="0" max="1" step="0.01" value={app.volume} oninput={onVolume} />
@@ -87,7 +84,6 @@
 		--focus: #2ed573;
 		--error: #ff6b6b;
 		--color-ok: #2ed573;
-		--color-sleep: #ffa502;
 		--color-disabled: #ff4757;
 		--color-off: #555;
 		--waveform-dim: #555;
@@ -107,7 +103,6 @@
 		--focus: #27ae60;
 		--error: #c0392b;
 		--color-ok: #27ae60;
-		--color-sleep: #e67e22;
 		--color-disabled: #e74c3c;
 		--color-off: #bbb;
 		--waveform-dim: #ccc;
@@ -155,9 +150,6 @@
 	}
 	.st-ok {
 		background: var(--color-ok);
-	}
-	.st-sleep {
-		background: var(--color-sleep);
 	}
 	.st-disabled {
 		background: var(--color-disabled);
