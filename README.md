@@ -23,24 +23,12 @@ Alternative: `./models.sh` downloads the default set automatically (needs `pip i
 
 ## Build
 
-```bash
+```
 git clone --recurse-submodules https://github.com/Serveurperso/acestep.cpp
 cd acestep.cpp
 ```
 
-Linux / macOS:
-
-```bash
-./buildcuda.sh    # NVIDIA GPU
-./buildvulkan.sh  # AMD/Intel GPU (Vulkan)
-./buildcpu.sh     # CPU only (with BLAS)
-./buildall.sh     # all backends (CUDA + Vulkan + CPU, runtime loading)
-```
-
-macOS auto-enables Metal and Accelerate BLAS with any of the above.
-
-<details>
-<summary>Windows</summary>
+### Windows
 
 Pre-built binaries (until CI is set up): https://www.serveurperso.com/temp/acestep.cpp-win64/
 
@@ -56,7 +44,16 @@ buildvulkan.cmd   # AMD/Intel GPU (Vulkan)
 buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 ```
 
-</details>
+### Linux / macOS
+
+```bash
+./buildcuda.sh    # NVIDIA GPU
+./buildvulkan.sh  # AMD/Intel GPU (Vulkan)
+./buildcpu.sh     # CPU only (with BLAS)
+./buildall.sh     # all backends (CUDA + Vulkan + CPU, runtime loading)
+```
+
+macOS auto-enables Metal and Accelerate BLAS with any of the above.
 
 ## Run
 
