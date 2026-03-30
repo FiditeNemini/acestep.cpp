@@ -3,6 +3,9 @@
 Local AI music generation server with browser UI, powered by GGML.
 Describe a song, get stereo 48kHz audio. Runs on CPU, CUDA, Metal, Vulkan.
 
+<img width="1704" height="773" alt="Light" src="https://github.com/user-attachments/assets/aeda150a-46a2-4542-a2d6-57d238a7bbb4" />
+<img width="1705" height="771" alt="Dark" src="https://github.com/user-attachments/assets/4941cec9-b6ff-4e09-8905-bdc3ee06d222" />
+
 ## Download models
 
 Grab one GGUF of each type from Hugging Face and drop them in the `models/` folder:
