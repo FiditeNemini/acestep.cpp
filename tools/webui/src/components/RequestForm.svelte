@@ -561,7 +561,7 @@
 	<button type="button" disabled={busy} onclick={compose}>Compose</button>
 
 	<details open>
-		<summary>Diffusion parameters</summary>
+		<summary>Flow matching parameters</summary>
 		<div class="details-body">
 			<div class="meta-grid">
 				<label
