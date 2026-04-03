@@ -579,17 +579,17 @@
 		</div>
 	</details>
 
-	<div class="selector-row">
-		<label class="selector-label"
-			>Batch <input
-				type="number"
-				class="batch-input"
-				min="1"
-				max={app.props?.cli?.max_batch || 9}
-				bind:value={app.request.lm_batch_size}
-			/></label
-		>
-		<span class="selector-label">Pending</span>
+	<div class="model-row">
+		<span class="model-label">Batch</span>
+		<input
+			type="number"
+			class="batch-input"
+			min="1"
+			max={app.props?.cli?.max_batch || 9}
+			bind:value={app.request.lm_batch_size}
+		/>
+		<span class="spacer"></span>
+		<span class="row-label">Pending</span>
 		<div class="pending-nav">
 			<button type="button" class="nav-btn" onclick={() => switchPending(-1)}>&lt;</button>
 			<span class="nav-label"
@@ -691,21 +691,21 @@
 		</div>
 	</details>
 
-	<div class="selector-row">
-		<label class="selector-label"
-			>Batch <input
-				type="number"
-				class="batch-input"
-				min="1"
-				max="9"
-				bind:value={app.request.synth_batch_size}
-			/></label
-		>
-		<span class="selector-label">Format</span>
-		<label class="selector-label">
+	<div class="model-row">
+		<span class="model-label">Batch</span>
+		<input
+			type="number"
+			class="batch-input"
+			min="1"
+			max="9"
+			bind:value={app.request.synth_batch_size}
+		/>
+		<span class="spacer"></span>
+		<span class="row-label">Format</span>
+		<label class="radio-label">
 			<input type="radio" name="format" value="mp3" bind:group={app.format} /> MP3
 		</label>
-		<label class="selector-label">
+		<label class="radio-label">
 			<input type="radio" name="format" value="wav" bind:group={app.format} /> WAV
 		</label>
 	</div>
@@ -794,18 +794,21 @@
 		flex: 1;
 		min-width: 0;
 	}
-	.selector-row {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
+	.spacer {
+		flex: 1;
 	}
-	.selector-label {
-		flex-direction: row;
-		align-items: center;
-		gap: 0.3rem;
-		cursor: pointer;
+	.row-label {
 		font-size: 0.85rem;
 		color: var(--fg-dim);
+		flex-shrink: 0;
+	}
+	.radio-label {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.2rem;
+		font-size: 0.85rem;
+		color: var(--fg-dim);
+		cursor: pointer;
 	}
 	.batch-input {
 		padding: 0.2rem 0.3rem;
