@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { RotateCcw, Download, FolderOpen } from '@lucide/svelte';
 	import { app, toast, setRequest } from '../lib/state.svelte.js';
+	import { rollDice } from '../lib/dice.js';
 	import {
 		lmGenerate,
 		lmInspire,
@@ -257,7 +258,8 @@
 	}
 
 	// shared: call an LM endpoint and load results into the form.
-	// preserves synth params (steps, CFG, shift, seed, batch, cover strength).
+	// LM enriches: caption, lyrics, bpm, duration, keyscale, timesignature, vocal_language, audio_codes.
+	// Everything else is preserved from the current UI state.
 	async function lmCall(fn: (req: AceRequest) => Promise<AceRequest[]>) {
 		busy = true;
 		try {
@@ -275,7 +277,14 @@
 					seed: app.request.seed,
 					audio_cover_strength: app.request.audio_cover_strength,
 					cover_noise_strength: app.request.cover_noise_strength,
-					synth_batch_size: app.request.synth_batch_size
+					repaint_strength: app.request.repaint_strength,
+					synth_batch_size: app.request.synth_batch_size,
+					lm_batch_size: app.request.lm_batch_size,
+					lm_temperature: app.request.lm_temperature,
+					lm_cfg_scale: app.request.lm_cfg_scale,
+					lm_top_p: app.request.lm_top_p,
+					lm_top_k: app.request.lm_top_k,
+					lm_negative_prompt: app.request.lm_negative_prompt
 				});
 			}
 		} catch (e: unknown) {
@@ -283,6 +292,11 @@
 		} finally {
 			busy = false;
 		}
+	}
+
+	// Dice: pick a random example prompt and fill the caption
+	function dice() {
+		setRequest(rollDice());
 	}
 
 	// Inspire: short caption -> fresh metadata + lyrics (no audio codes)
@@ -489,46 +503,40 @@
 		></textarea>
 	</label>
 
-	<details open>
-		<summary>Metadata</summary>
-		<div class="details-body">
-			<div class="meta-grid">
-				<label
-					>Language <input
-						type="text"
-						placeholder={ph(d?.vocal_language)}
-						bind:value={app.request.vocal_language}
-					/></label
-				>
-				<label
-					>BPM <input type="text" placeholder={ph(d?.bpm)} bind:value={app.request.bpm} /></label
-				>
-				<label
-					>Duration <input
-						type="text"
-						placeholder={ph(d?.duration)}
-						bind:value={app.request.duration}
-					/></label
-				>
-				<label
-					>Key <input
-						type="text"
-						placeholder={ph(d?.keyscale)}
-						bind:value={app.request.keyscale}
-					/></label
-				>
-				<label
-					>Time sig <input
-						type="text"
-						placeholder={ph(d?.timesignature)}
-						bind:value={app.request.timesignature}
-					/></label
-				>
-			</div>
-		</div>
-	</details>
+	<div class="meta-grid">
+		<label
+			>Language <input
+				type="text"
+				placeholder={ph(d?.vocal_language)}
+				bind:value={app.request.vocal_language}
+			/></label
+		>
+		<label>BPM <input type="text" placeholder={ph(d?.bpm)} bind:value={app.request.bpm} /></label>
+		<label
+			>Duration <input
+				type="text"
+				placeholder={ph(d?.duration)}
+				bind:value={app.request.duration}
+			/></label
+		>
+		<label
+			>Key <input
+				type="text"
+				placeholder={ph(d?.keyscale)}
+				bind:value={app.request.keyscale}
+			/></label
+		>
+		<label
+			>Time sig <input
+				type="text"
+				placeholder={ph(d?.timesignature)}
+				bind:value={app.request.timesignature}
+			/></label
+		>
+	</div>
 
 	<div class="lm-row">
+		<button type="button" disabled={busy} onclick={dice}>Dice</button>
 		<button type="button" disabled={busy} onclick={inspire}>Inspire</button>
 		<button type="button" disabled={busy} onclick={format}>Format</button>
 	</div>
@@ -876,6 +884,8 @@
 		background: var(--bg-err, #c0392b);
 		color: #fff;
 		opacity: 0.6;
+		text-align: center;
+		flex: 1;
 	}
 	.dit-ind.on {
 		background: var(--bg-ok, #27ae60);
@@ -893,6 +903,7 @@
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.3rem;
+		flex: 1;
 	}
 	.track-pill {
 		padding: 0.2rem 0.5rem;
@@ -903,6 +914,9 @@
 		cursor: pointer;
 		background: var(--bg-input);
 		color: var(--fg-dim);
+		text-align: center;
+		flex: 1;
+		max-width: 33%;
 	}
 	.track-pill.active {
 		background: var(--bg-btn-hover);

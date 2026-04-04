@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { app } from '../lib/state.svelte.js';
+	import { SSE_RECONNECT_MS, LOG_MAX_LINES } from '../lib/config.js';
 	import { ChevronDown, ChevronRight } from '@lucide/svelte';
 
 	let lines = $state<string[]>([]);
-	let container = $state<HTMLPreElement>();
 
 	$effect(() => {
 		let es: EventSource | null = null;
@@ -13,18 +13,14 @@
 			es = new EventSource('logs');
 			es.onmessage = (e: MessageEvent) => {
 				lines.push(e.data);
-				if (lines.length > 500) lines.splice(0, lines.length - 500);
-				const el = container;
-				if (app.logsOpen && el) {
-					requestAnimationFrame(() => {
-						el.scrollTop = el.scrollHeight;
-					});
-				}
+				if (lines.length > LOG_MAX_LINES) lines.splice(0, lines.length - LOG_MAX_LINES);
 			};
 			es.onerror = () => {
 				es?.close();
 				es = null;
-				timer = setTimeout(connect, 2000) as unknown as number;
+				lines.push('[Client] Server unavailable');
+				if (lines.length > LOG_MAX_LINES) lines.splice(0, lines.length - LOG_MAX_LINES);
+				timer = setTimeout(connect, SSE_RECONNECT_MS) as unknown as number;
 			};
 		}
 
@@ -46,7 +42,7 @@
 		<span class="card-label">Server logs</span>
 	</button>
 	{#if app.logsOpen}
-		<pre class="log-body" bind:this={container}>{lines.join('\n')}</pre>
+		<pre class="log-body">{lines.join('\n')}</pre>
 	{/if}
 </div>
 
@@ -85,8 +81,6 @@
 		line-height: 1.4;
 		color: var(--fg-dim);
 		background: var(--bg-card);
-		overflow-y: auto;
-		height: 400px;
 		white-space: pre-wrap;
 		word-break: break-all;
 	}

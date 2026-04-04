@@ -8,10 +8,9 @@ export async function lmGenerate(req: AceRequest): Promise<AceRequest[]> {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(req)
 	});
-	if (res.status === 503) throw new Error('Server busy');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 	return res.json();
 }
@@ -23,10 +22,9 @@ export async function lmInspire(req: AceRequest): Promise<AceRequest[]> {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(req)
 	});
-	if (res.status === 503) throw new Error('Server busy');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 	return res.json();
 }
@@ -38,10 +36,9 @@ export async function lmFormat(req: AceRequest): Promise<AceRequest[]> {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(req)
 	});
-	if (res.status === 503) throw new Error('Server busy');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 	return res.json();
 }
@@ -56,10 +53,9 @@ export async function synthGenerate(reqs: AceRequest[], format: string): Promise
 		headers: { 'Content-Type': 'application/json' },
 		body
 	});
-	if (res.status === 503) throw new Error('Server busy');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 
 	const ct = res.headers.get('Content-Type') || '';
@@ -91,10 +87,9 @@ export async function synthGenerateWithAudio(
 	if (srcAudio) form.append('audio', srcAudio, 'src.audio');
 	if (refAudio) form.append('ref_audio', refAudio, 'ref.audio');
 	const res = await fetch(url, { method: 'POST', body: form });
-	if (res.status === 503) throw new Error('Server busy');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 
 	const ct = res.headers.get('Content-Type') || '';
@@ -158,11 +153,9 @@ export async function understandAudio(blob: Blob): Promise<AceRequest> {
 		method: 'POST',
 		body: form
 	});
-	if (res.status === 503) throw new Error('Server busy');
-	if (res.status === 501) throw new Error('Understand pipeline not loaded (requires LM + synth)');
 	if (!res.ok) {
 		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error || res.statusText);
+		throw new Error(`${res.status} ${err.error || res.statusText}`);
 	}
 	return res.json();
 }
@@ -172,6 +165,6 @@ export async function props(): Promise<AceProps> {
 	const res = await fetch('props', {
 		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
 	});
-	if (!res.ok) throw new Error('Server unreachable');
+	if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 	return res.json();
 }
