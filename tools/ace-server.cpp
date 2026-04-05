@@ -2,19 +2,22 @@
 //
 // Single binary, three endpoints (POST /lm, POST /synth, POST /understand),
 // one port. Models are discovered by scanning --models directory at startup
-// (GGUF headers only, zero GPU). Load-on-demand: models are loaded into
-// VRAM on first request and swapped when the JSON request specifies a
-// different "synth_model", "lm_model", or "lora".
+// (reads GGUF metadata only, no weights loaded).
+//
+// Each request loads the model, executes, and frees it. No model persists
+// in VRAM between requests unless --keep-loaded is set. A single GPU mutex
+// serializes access (503 if busy).
 //
 // Available models are classified by their GGUF general.architecture:
-//   acestep-lm       -> lm bucket     (enables /lm + /understand)
-//   acestep-dit      -> dit bucket    (enables /synth, with text-encoder + vae)
+//   acestep-lm       -> lm bucket
+//   acestep-dit      -> dit bucket
 //   acestep-text-enc -> text-enc bucket (singleton, first entry used)
 //   acestep-vae      -> vae bucket      (singleton, first entry used)
 //
-// When both LM and synth are loaded, /synth runs on its own mutex so it
-// can overlap with /lm on the GPU. /lm and /understand share mtx_lm
-// (same Qwen3 KV cache).
+// Endpoint requirements:
+//   /lm         LM
+//   /synth      DiT + Text-Enc + VAE
+//   /understand LM + DiT + VAE
 
 #include "audio-io.h"
 #include "model-registry.h"
@@ -120,19 +123,16 @@ static void on_signal(int) {
     }
 }
 
-// pipeline mutexes.
-// /lm and /understand always lock mtx_lm (shared Qwen3 KV cache).
-// /synth locks mtx_synth when both pipelines are available (disjoint GPU mem,
-// safe to overlap). when synth is the only pipeline, it uses mtx_lm.
-static std::mutex mtx_lm;
-static std::mutex mtx_synth;
+// single GPU mutex. httplib uses a thread pool, but only one request
+// can use the GPU at a time. try_to_lock returns 503 if busy.
+static std::mutex mtx_gpu;
 
 // pipeline contexts. NULL when not loaded.
 static AceLm *         g_ctx_lm         = nullptr;
 static AceSynth *      g_ctx_synth      = nullptr;
 static AceUnderstand * g_ctx_understand = nullptr;
 
-// model registry (populated at startup, zero GPU)
+// model registry (populated at startup from GGUF metadata)
 static ModelRegistry g_registry;
 
 // loaded model names (empty = nothing loaded)
@@ -147,8 +147,9 @@ static AceSynthParams      g_synth_params;
 static AceUnderstandParams g_und_params;
 
 // limits
-static int g_max_batch = 1;
-static int g_mp3_kbps  = 128;
+static int  g_max_batch   = 1;
+static int  g_mp3_kbps    = 128;
+static bool g_keep_loaded = false;
 
 // log capture: intercept stderr via pipe, forward to terminal + ring buffer.
 // SSE clients connect to /logs and receive lines in real time.
@@ -365,8 +366,8 @@ static void parse_server_fields(const char * json, ServerFields * sf) {
     yyjson_doc_free(doc);
 }
 
-// load-on-demand: load LM + understand if name differs from current.
-// called under mtx_lm. returns false on failure (caller should 500).
+// load LM + understand. frees previous contexts first.
+// returns false on failure (caller returns 500).
 static bool ensure_lm(const std::string & name) {
     if (g_ctx_lm && g_loaded_lm == name) {
         return true;
@@ -410,8 +411,8 @@ static bool ensure_lm(const std::string & name) {
     return true;
 }
 
-// load-on-demand: load synth pipeline if DiT/LoRA config differs.
-// called under the appropriate synth mutex. returns false on failure.
+// load synth pipeline (DiT + LoRA + text-enc + VAE). frees previous context first.
+// returns false on failure (caller returns 500).
 static bool ensure_synth(const std::string & dit_name, const std::string & lora_name, float lora_scale) {
     if (g_ctx_synth && g_loaded_dit == dit_name && g_loaded_lora == lora_name && g_loaded_lora_scale == lora_scale) {
         return true;
@@ -521,22 +522,32 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
     }
 
     // try to acquire GPU. 503 instantly if busy.
-    std::unique_lock<std::mutex> lock(mtx_lm, std::try_to_lock);
+    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
     if (!lock.owns_lock()) {
         json_busy(res);
         return;
     }
 
-    // load-on-demand
+    // load
     std::string lm_name = resolve_name(g_registry.lm, sf.lm_model, g_loaded_lm);
     if (!ensure_lm(lm_name)) {
         json_error(res, 500, "Failed to load LM");
         return;
     }
 
+    // execute
     std::vector<AceRequest> out(lm_batch_size);
     int rc = ace_lm_generate(g_ctx_lm, &ace_req, lm_batch_size, out.data(), NULL, NULL, server_cancel,
                              (void *) &req.is_connection_closed, mode);
+
+    // free
+    if (!g_keep_loaded) {
+        ace_understand_free(g_ctx_understand);
+        g_ctx_understand = nullptr;
+        ace_lm_free(g_ctx_lm);
+        g_ctx_lm = nullptr;
+        g_loaded_lm.clear();
+    }
     lock.unlock();
 
     if (rc != 0) {
@@ -672,10 +683,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
     std::vector<AceAudio> audio(total_alloc);
     int                   audio_idx = 0;
 
-    // synth gets its own mutex when LM is also available (disjoint GPU mem).
-    // try_lock: 503 instantly if GPU busy. held for all groups.
-    std::mutex &                 mtx = g_registry.lm.empty() ? mtx_lm : mtx_synth;
-    std::unique_lock<std::mutex> lock(mtx, std::try_to_lock);
+    // try_lock: 503 instantly if GPU busy.
+    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
     if (!lock.owns_lock()) {
         free(src_interleaved);
         free(ref_interleaved);
@@ -683,7 +692,7 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         return;
     }
 
-    // load-on-demand: resolve DiT + LoRA
+    // load
     std::string dit_name = resolve_name(g_registry.dit, sf.synth_model, g_loaded_dit);
     if (!ensure_synth(dit_name, sf.lora, sf.lora_scale)) {
         free(src_interleaved);
@@ -718,6 +727,12 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
                                     group_audio.data(), server_cancel, (void *) &req.is_connection_closed);
 
         if (rc != 0) {
+            if (!g_keep_loaded) {
+                ace_synth_free(g_ctx_synth);
+                g_ctx_synth = nullptr;
+                g_loaded_dit.clear();
+                g_loaded_lora.clear();
+            }
             lock.unlock();
             free(src_interleaved);
             free(ref_interleaved);
@@ -734,6 +749,14 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
         for (int i = 0; i < sbs; i++) {
             audio[audio_idx++] = group_audio[i];
         }
+    }
+
+    // free
+    if (!g_keep_loaded) {
+        ace_synth_free(g_ctx_synth);
+        g_ctx_synth = nullptr;
+        g_loaded_dit.clear();
+        g_loaded_lora.clear();
     }
     lock.unlock();
     free(src_interleaved);
@@ -797,8 +820,8 @@ static void handle_synth(const httplib::Request & req, httplib::Response & res) 
 //   application/json body        -> codes-only (audio_codes in JSON, skip VAE+FSQ)
 // returns: application/json AceRequest with metadata + lyrics + codes
 static void handle_understand(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.lm.empty()) {
-        json_error(res, 501, "No LM models in registry");
+    if (g_registry.lm.empty() || g_registry.dit.empty() || g_registry.vae.empty()) {
+        json_error(res, 501, "Understand requires LM, DiT and VAE models");
         return;
     }
 
@@ -857,16 +880,15 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
         }
     }
 
-    // try_lock mtx_lm: understand shares the Qwen3 model with /lm,
-    // so they must never touch the KV cache concurrently.
-    std::unique_lock<std::mutex> lock(mtx_lm, std::try_to_lock);
+    // try to acquire GPU. 503 instantly if busy.
+    std::unique_lock<std::mutex> lock(mtx_gpu, std::try_to_lock);
     if (!lock.owns_lock()) {
         free(src_interleaved);
         json_busy(res);
         return;
     }
 
-    // load-on-demand
+    // load
     std::string lm_name = resolve_name(g_registry.lm, "", g_loaded_lm);
     if (!ensure_lm(lm_name)) {
         free(src_interleaved);
@@ -877,6 +899,15 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
     AceRequest out;
     int        rc = ace_understand_generate(g_ctx_understand, src_interleaved, src_len, &ace_req, &out, server_cancel,
                                             (void *) &req.is_connection_closed);
+
+    // free
+    if (!g_keep_loaded) {
+        ace_understand_free(g_ctx_understand);
+        g_ctx_understand = nullptr;
+        ace_lm_free(g_ctx_lm);
+        g_ctx_lm = nullptr;
+        g_loaded_lm.clear();
+    }
     lock.unlock();
     free(src_interleaved);
 
@@ -889,8 +920,8 @@ static void handle_understand(const httplib::Request & req, httplib::Response & 
 }
 
 // GET /props
-// server configuration, available models, loaded state, and default request.
-// used by the webui at boot to populate dropdowns and status indicators.
+// server configuration, available models, and default request.
+// the webui reads this at boot to populate dropdowns and status indicators.
 static void handle_props(const httplib::Request &, httplib::Response & res) {
     yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
     yyjson_mut_val * root = yyjson_mut_obj(doc);
@@ -957,7 +988,8 @@ static void usage(const char * prog) {
             "LoRA:\n"
             "  --loras <dir>           Directory of LoRA adapters\n"
             "\n"
-            "VAE tiling (memory control):\n"
+            "Memory control:\n"
+            "  --keep-loaded           Keep models in VRAM between requests\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n"
             "\n"
@@ -1005,6 +1037,8 @@ int main(int argc, char ** argv) {
             g_synth_params.vae_chunk = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--vae-overlap") && i + 1 < argc) {
             g_synth_params.vae_overlap = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--keep-loaded")) {
+            g_keep_loaded = true;
 
             // output
         } else if (!strcmp(argv[i], "--mp3-bitrate") && i + 1 < argc) {
@@ -1050,7 +1084,7 @@ int main(int argc, char ** argv) {
     // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
     LogCapture log_capture;
 
-    // scan models directory (header-only, zero GPU)
+    // scan models directory (reads GGUF metadata only)
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
     if (!registry_scan(&g_registry, models_dir)) {
         fprintf(stderr, "[Server] ERROR: no GGUF models found in %s\n", models_dir);
@@ -1082,14 +1116,16 @@ int main(int argc, char ** argv) {
     }
     g_lm_params.max_batch = g_max_batch;
 
-    // init understand params (dit/vae paths set lazily in ensure_lm when synth is available)
+    // init understand params (dit/vae for audio encoding, independent of synth pipeline)
     ace_understand_default_params(&g_und_params);
     g_und_params.use_fa  = g_lm_params.use_fa;
     g_und_params.use_fsm = g_lm_params.use_fsm;
-    if (have_synth) {
+    if (!g_registry.dit.empty() && !g_registry.vae.empty()) {
         g_und_params.dit_path = g_registry.dit[0].path.c_str();
         g_und_params.vae_path = g_registry.vae[0].path.c_str();
     }
+
+    bool have_understand = have_lm && !g_registry.dit.empty() && !g_registry.vae.empty();
 
     // setup HTTP server
     httplib::Server svr;
@@ -1142,7 +1178,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[Server] acestep.cpp %s\n", ACE_VERSION);
     fprintf(stderr, "[Server] Listening on %s:%d\n", host, port);
     fprintf(stderr, "[Server] Pipelines:%s%s%s\n", have_lm ? " /lm" : "", have_synth ? " /synth" : "",
-            have_lm ? " /understand" : "");
+            have_understand ? " /understand" : "");
     fprintf(stderr, "[Server] Models: %zu LM, %zu Text-Enc, %zu DiT, %zu VAE, %zu LoRA\n", g_registry.lm.size(),
             g_registry.text_enc.size(), g_registry.dit.size(), g_registry.vae.size(), g_registry.loras.size());
     if (!svr.listen(host, port)) {

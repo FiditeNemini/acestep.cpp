@@ -289,7 +289,7 @@ static void print_usage(const char * prog) {
             "  --q4                    Quantize latent to int4 (~6.8 kbit/s)\n\n"
             "Output naming: song.wav -> song.latent (f32) or song.nac8 (Q8) or song.nac4 (Q4)\n"
             "               song.latent -> song.wav\n\n"
-            "VAE tiling (memory control):\n"
+            "Memory control:\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n\n"
             "Latent formats (decode auto-detects):\n"

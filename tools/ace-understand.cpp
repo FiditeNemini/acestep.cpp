@@ -42,7 +42,7 @@ static void usage(const char * prog) {
             "request JSON. Without --request, understand defaults apply\n"
             "(temperature=0.3, top_p disabled).\n"
             "\n"
-            "VAE tiling:\n"
+            "Memory control:\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n"
             "\n"

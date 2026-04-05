@@ -664,7 +664,7 @@ Output:
   --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
   --wav                   Output WAV instead of MP3
 
-VAE tiling (memory control):
+Memory control:
   --vae-chunk <N>         Latent frames per tile (default: 256)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
@@ -709,16 +709,16 @@ HTTP server exposing the same pipelines as `ace-lm`, `ace-synth`, and
 
 `--models` scans a directory for GGUF files and classifies each by its
 `general.architecture` metadata into LM, Text-Enc, DiT, and VAE buckets.
-Models are loaded on demand when a request arrives, and swapped when the
-request JSON specifies a different `synth_model`, `lm_model`, or `lora`.
+Each request loads the model, executes, and frees it. With `--keep-loaded`,
+models persist in VRAM and are reused across requests. A single GPU mutex
+serializes all endpoint access (503 if busy).
 
 | Pipeline | GGUF architectures needed | Enables | VRAM (approx) |
 |:---------|:--------------------------|:--------|:--------------|
-| LM | `acestep-lm` | /lm, /understand | ~7 GB (batch=1) |
+| LM | `acestep-lm` | /lm | ~7 GB (batch=1) |
 | Synth | `acestep-text-enc` + `acestep-dit` + `acestep-vae` | /synth | ~12 GB |
+| Understand | `acestep-lm` + `acestep-dit` + `acestep-vae` | /understand | ~7 GB |
 
-When models for both pipelines are present, all three endpoints are active
-and /synth runs concurrently with /lm (disjoint GPU memory, separate mutexes).
 Endpoints whose pipeline has no models in the registry return 501.
 
 ```
@@ -730,7 +730,8 @@ Required:
 LoRA:
   --loras <dir>           Directory of LoRA adapters
 
-VAE tiling (memory control):
+Memory control:
+  --keep-loaded           Keep models in VRAM between requests
   --vae-chunk <N>         Latent frames per tile (default: 256)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
@@ -753,7 +754,7 @@ Debug:
 Examples:
 
 ```bash
-# all models in one directory, load on demand
+# all models in one directory
 ./ace-server --models /path/to/models
 
 # with LoRA adapters
@@ -815,18 +816,14 @@ Error responses are JSON: `{"error":"message"}` with 400, 500, 501, or
 
 ### Concurrency
 
-When both LM and synth are loaded, /synth gets its own mutex and runs
-concurrently with /lm on the GPU (disjoint models, disjoint memory).
-/lm and /understand always share a mutex because they use the same
-Qwen3 KV cache. When only one group is loaded, everything is serial.
+A single GPU mutex serializes all endpoint access. Each handler uses
+`try_lock`: if the GPU is busy, the client gets an instant 503 with
+`Retry-After`. No request ever blocks waiting for another to finish.
 
-Each handler uses `try_lock`: if the GPU is busy, the client gets an
-instant 503 with `Retry-After`. No request ever blocks waiting for
-another to finish.
-
-When the requested model differs from the one currently loaded, the old
-model is freed and the new one is loaded from disk before processing the
-request. If the load fails, the handler returns 500.
+By default, each request loads its model, executes, and frees it.
+With `--keep-loaded`, models persist in VRAM and are reused. If the
+requested model differs from the one currently loaded, the old model
+is freed and the new one is loaded before processing.
 
 Request bodies are limited to 120 MB (enough for a 10-minute WAV upload
 via multipart).
@@ -854,7 +851,7 @@ Output:
 Output naming: song.wav -> song.latent (f32) or song.nac8 (Q8) or song.nac4 (Q4)
                song.latent -> song.wav
 
-VAE tiling (memory control):
+Memory control:
   --vae-chunk <N>         Latent frames per tile (default: 256)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
@@ -947,7 +944,7 @@ Sampling params (lm_temperature, lm_top_p, lm_top_k) come from the
 request JSON. Without --request, understand defaults apply
 (temperature=0.3, top_p disabled).
 
-VAE tiling:
+Memory control:
   --vae-chunk <N>         Latent frames per tile (default: 256)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 

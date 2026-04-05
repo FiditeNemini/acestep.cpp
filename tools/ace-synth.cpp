@@ -32,7 +32,7 @@ static void usage(const char * prog) {
             "  Default: MP3 at 128 kbps. input.json -> input0.mp3, input1.mp3, ...\n"
             "  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)\n"
             "  --wav                   Output WAV instead of MP3\n\n"
-            "VAE tiling (memory control):\n"
+            "Memory control:\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n\n"
             "Debug:\n"
