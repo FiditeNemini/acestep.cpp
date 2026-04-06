@@ -112,11 +112,12 @@ int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthSt
 // ops_fsq_roundtrip
 void ops_fsq_roundtrip(AceSynth * ctx, SynthState & s) {
     // FSQ roundtrip for cover: tokenize (25Hz->5Hz) + detokenize (5Hz->25Hz).
-    // The lossy FSQ bottleneck gives the DiT creative freedom to produce a
-    // reinterpretation of the source rather than a rigid copy. The cover stays
-    // rhythmically and melodically synchronized with the original while the DiT
-    // works on its training distribution latents instead of clean VAE latents.
-    // cover-nofsq skips this call. Other tasks use clean latents directly.
+    // The lossy 5:1 temporal compression destroys micro-timings, ornaments and
+    // transients. The DiT receives degraded latents and diverges from the source,
+    // producing a free reinterpretation rather than a close remix.
+    // cover-nofsq skips this call and feeds clean 25Hz VAE latents directly,
+    // producing remixes that stay close to the source.
+    // Other tasks (lego, extract, repaint, complete) also use clean latents.
     if (s.have_cover && ctx->have_tok && ctx->have_detok) {
         s.timer.reset();
         int              T_5Hz = (s.T_cover + 4) / 5;

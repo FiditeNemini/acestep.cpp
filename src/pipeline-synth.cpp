@@ -327,13 +327,11 @@ int ace_synth_generate(AceSynth *         ctx,
         } else if (s.task == TASK_COVER) {
             s.use_source_context = true;
             s.instruction_str    = DIT_INSTR_COVER;
-            ops_fsq_roundtrip(ctx, s);  // lossy FSQ: creative freedom + rhythmic sync
+            ops_fsq_roundtrip(ctx, s);  // FSQ degrades source latents, DiT diverges from original
         } else if (s.task == TASK_COVER_NOFSQ) {
-            // expert research mode: skip FSQ roundtrip, feed clean VAE latents.
-            // off-distribution (DiT trained on FSQ latents for cover instruction).
-            // without FSQ the source is too clean and the DiT reproduces verbatim.
-            // use SFT model, pass ref_audio = src_audio for timbre conditioning,
-            // and lower audio_cover_strength (0.02 to 0.2) to let the DiT hallucinate.
+            // cover without FSQ roundtrip: DiT works on clean VAE latents at 25Hz.
+            // produces remixes that stay close to the source structure and timbre.
+            // pass ref_audio = src_audio for best results.
             s.use_source_context = true;
             s.instruction_str    = DIT_INSTR_COVER;
         } else if (s.task == TASK_REPAINT) {

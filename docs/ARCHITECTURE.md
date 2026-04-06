@@ -256,24 +256,21 @@ Run `ace-synth` to decode existing codes. See `examples/dit-only.json`.
 **Cover** (`"task_type": "cover"` + `--src-audio`): no LLM needed. The source audio
 (WAV or MP3, any sample rate) is resampled to 48kHz, VAE-encoded to latent
 space, then passed through an FSQ roundtrip (tokenize 25Hz to 5Hz, detokenize
-back to 25Hz) that deliberately degrades the latents. This lossy bottleneck
-gives the DiT creative freedom to reinterpret the source rather than copy it.
+back to 25Hz). The lossy 5:1 temporal compression destroys micro-timings,
+ornaments and transients, so the DiT diverges from the source and produces
+a free reinterpretation rather than a close remix.
 `audio_cover_strength` in the JSON controls how many DiT steps see the source
 (0.5 = half the steps use source context, half use silence). The caption
-steers the style while the source provides structure, melody, and rhythm.
+steers the style while the source provides loose structure.
 Duration is determined by the source audio.
 
-**Cover-nofsq** (`"task_type": "cover-nofsq"` + `--src-audio`): expert research
-mode. Same as cover but skips the FSQ roundtrip: the DiT receives clean VAE
-latents instead of FSQ-degraded ones. This is off-distribution (the DiT was
-trained with FSQ latents for the cover instruction). Without FSQ the source signal is too clean and the DiT
-tends to reproduce the input verbatim. Use the SFT model, pass `--ref-audio`
-pointing to the same file as `--src-audio` for timbre conditioning, and lower
-`audio_cover_strength` (0.02 to 0.2) to reduce the number of steps that see
-the source context and let the DiT hallucinate. Can produce good results on
-simple compositions or tracks close to the DiT training distribution.
-Heavy cherry-picking across seeds is expected.
-Same JSON fields as cover, just change the task_type.
+**Cover-nofsq** (`"task_type": "cover-nofsq"` + `--src-audio`): cover variant
+that skips the FSQ roundtrip. The DiT receives clean VAE latents at 25Hz,
+preserving the full detail of the source. Produces remixes that stay close
+to the original structure, melody, and timbre. Pass `--ref-audio` pointing to
+the same file as `--src-audio` for best results.
+`audio_cover_strength` works well at higher values (0.2 to 0.5) compared to
+regular cover. Same JSON fields as cover, just change the task_type.
 
 **Repaint** (`"task_type": "repaint"` + `--src-audio`):
 regenerates a time region of the source audio while preserving the rest.
@@ -364,12 +361,11 @@ What the DiT actually receives in its 128-channel context `[src(64) | mask(64)]`
 | extract | raw VAE src | 1.0 | "Extract the TRACK track..." |
 | complete | raw VAE src | 1.0 | "Complete the input track..." |
 
-cover uses an FSQ roundtrip (tokenize 25Hz->5Hz then detokenize 5Hz->25Hz) to give
-the DiT creative freedom while retaining rhythmic/melodic structure from the source.
-cover-nofsq skips this roundtrip: same instruction, clean latents. Expert
-research mode. Use SFT model, pass
-ref_audio = src_audio, and lower audio_cover_strength (0.02 to 0.2) to let the
-DiT hallucinate instead of reproducing the source verbatim.
+cover uses an FSQ roundtrip (tokenize 25Hz->5Hz then detokenize 5Hz->25Hz). The
+lossy compression destroys source detail and the DiT diverges freely.
+cover-nofsq skips this roundtrip: same instruction, clean 25Hz latents. The DiT
+stays close to the source and produces faithful remixes. Pass
+ref_audio = src_audio for best results.
 All other tasks with source audio use raw VAE latents (no FSQ).
 
 ### Region-mode pipeline (repaint + lego with region)
@@ -537,11 +533,15 @@ Ignored for all other task types. Error if end <= start after resolve.
 **`task_type`** (string, default `""` = `text2music`)
 Controls the generation mode. This field is the single source of truth for
 what the pipeline does. Empty is equivalent to `text2music`.
-Values: `text2music`, `cover`, `repaint`, `lego`, `extract`, `complete`.
+Values: `text2music`, `cover`, `cover-nofsq`, `repaint`, `lego`, `extract`, `complete`.
 
 - `text2music`: standard text-to-music synthesis from silence.
-- `cover`: re-synthesize source audio with a new style. Requires `--src-audio`.
+- `cover`: re-synthesize source audio with a new style. FSQ roundtrip degrades
+  source latents, so the DiT diverges freely. Requires `--src-audio`.
   `audio_cover_strength` controls how many DiT steps see the source.
+- `cover-nofsq`: remix source audio without FSQ roundtrip. The DiT works on
+  clean 25Hz VAE latents and stays close to the original. Requires `--src-audio`.
+  Pass `--ref-audio` = `--src-audio` for best results.
 - `repaint`: regenerate a time region of the source audio. Requires `--src-audio`
   and `repainting_start/end`. Step injection keeps frames outside the zone anchored
   to the source; a waveform splice restores them to the original PCM post-decode.
