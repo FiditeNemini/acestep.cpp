@@ -266,10 +266,9 @@ int ops_clamp_region(SynthState & s) {
 
 // ops_encode_timbre
 void ops_encode_timbre(AceSynth * ctx, const float * ref_audio, int ref_len, SynthState & s) {
-    // 2. Timbre features from ref_audio (independent of src_audio).
-    // ref_audio = timbre reference, VAE-encoded to latents then first 750 frames used.
-    // NULL = silence (no timbre conditioning).
-    s.timbre_feats.resize(S_REF_TIMBRE * 64);
+    // Timbre features from ref_audio (independent of src_audio).
+    // VAE-encode ref_audio and pass all frames to the timbre encoder.
+    // NULL ref_audio = single silence frame (no timbre conditioning).
     if (ref_audio && ref_len > 0) {
         s.timer.reset();
         VAEEncoder ref_vae = {};
@@ -281,19 +280,17 @@ void ops_encode_timbre(AceSynth * ctx, const float * ref_audio, int ref_len, Syn
         vae_enc_free(&ref_vae);
         if (T_ref < 0) {
             fprintf(stderr, "[Encode-Timbre] WARNING: ref_audio encode failed, using silence\n");
-            memcpy(s.timbre_feats.data(), ctx->silence_full.data(), S_REF_TIMBRE * 64 * sizeof(float));
+            s.S_ref_timbre = 1;
+            s.timbre_feats.assign(ctx->silence_full.data(), ctx->silence_full.data() + 64);
         } else {
-            int copy_n = T_ref < S_REF_TIMBRE ? T_ref : S_REF_TIMBRE;
-            memcpy(s.timbre_feats.data(), ref_latents.data(), (size_t) copy_n * 64 * sizeof(float));
-            if (copy_n < S_REF_TIMBRE) {
-                memcpy(s.timbre_feats.data() + (size_t) copy_n * 64, ctx->silence_full.data() + (size_t) copy_n * 64,
-                       (size_t) (S_REF_TIMBRE - copy_n) * 64 * sizeof(float));
-            }
-            fprintf(stderr, "[Encode-Timbre] ref_audio: %d frames (%.1fs), %.1f ms\n", copy_n, (float) copy_n / 25.0f,
+            s.S_ref_timbre = T_ref;
+            s.timbre_feats.assign(ref_latents.data(), ref_latents.data() + (size_t) T_ref * 64);
+            fprintf(stderr, "[Encode-Timbre] ref_audio: %d frames (%.1fs), %.1f ms\n", T_ref, (float) T_ref / 25.0f,
                     s.timer.ms());
         }
     } else {
-        memcpy(s.timbre_feats.data(), ctx->silence_full.data(), S_REF_TIMBRE * 64 * sizeof(float));
+        s.S_ref_timbre = 1;
+        s.timbre_feats.assign(ctx->silence_full.data(), ctx->silence_full.data() + 64);
     }
 }
 
@@ -369,7 +366,7 @@ int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthS
         // CondEncoder forward
         s.timer.reset();
         cond_ggml_forward(&ctx->cond_enc, text_hidden.data(), S_text, lyric_embed.data(), S_lyric,
-                          s.timbre_feats.data(), S_REF_TIMBRE, s.per_enc[b], &s.per_enc_S[b]);
+                          s.timbre_feats.data(), s.S_ref_timbre, s.per_enc[b], &s.per_enc_S[b]);
         fprintf(stderr, "[Encode-Text Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n", b, S_text, S_lyric, s.per_enc_S[b],
                 s.timer.ms());
 
@@ -419,7 +416,7 @@ int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthS
             qwen3_embed_lookup(&ctx->text_enc, lyric_ids.data(), S_lyric, lyric_embed.data());
 
             cond_ggml_forward(&ctx->cond_enc, text_hidden.data(), S_text, lyric_embed.data(), S_lyric,
-                              s.timbre_feats.data(), S_REF_TIMBRE, s.per_enc_nc[b], &s.per_enc_S_nc[b]);
+                              s.timbre_feats.data(), s.S_ref_timbre, s.per_enc_nc[b], &s.per_enc_S_nc[b]);
             fprintf(stderr, "[Encode-Text Batch%d] non-cover: %d+%d tokens -> enc_S=%d\n", b, S_text, S_lyric,
                     s.per_enc_S_nc[b]);
         }

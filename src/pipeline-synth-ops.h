@@ -83,6 +83,7 @@ struct SynthState {
 
     // conditioning tensors
     std::vector<float> timbre_feats;
+    int                S_ref_timbre;  // actual timbre sequence length (from VAE encode)
 
     // text encoding (per-batch)
     std::vector<std::vector<float>> per_enc;
@@ -114,9 +115,6 @@ struct SynthState {
     Timer       timer;
 };
 
-// S_ref: timbre reference frame count (750 frames = 30s @ 25Hz, constant)
-static const int S_REF_TIMBRE = 750;
-
 // Encode src_audio -> cover_latents. Sets s.have_cover, s.cover_latents, s.T_cover.
 int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthState & s);
 
@@ -135,7 +133,7 @@ int ops_resolve_T(AceSynth * ctx, SynthState & s);
 // Clamp rs/re to source duration. Caller ensures a region task is active.
 int ops_clamp_region(SynthState & s);
 
-// Encode timbre from ref_audio (750-frame VAE + silence pad).
+// Encode timbre from ref_audio via VAE. Sets s.timbre_feats and s.S_ref_timbre.
 void ops_encode_timbre(AceSynth * ctx, const float * ref_audio, int ref_len, SynthState & s);
 
 // Per-batch text + lyric encoding (main pass + optional non-cover pass).

@@ -721,9 +721,10 @@ blends the initial noise with source latents to start diffusion closer to
 the source (default 0.0).
 
 `--ref-audio` provides a timbre reference, independent of the task. The audio
-is VAE-encoded and its first 750 latent frames (30s) are fed to the timbre
-encoder. This conditions the DiT to match the tonal quality of the reference.
-When omitted, the timbre encoder receives silence (no timbre conditioning).
+is VAE-encoded and fed to the 4-layer timbre encoder, which pools to a single
+embedding via frame[0]. This conditions the DiT to match the tonal quality of
+the reference. When omitted, the timbre encoder receives a single silence
+frame (no timbre conditioning).
 
 Batching comes from two sources: multiple `--request` files on the CLI
 (or JSON array on the server), and `synth_batch_size` inside each request.
