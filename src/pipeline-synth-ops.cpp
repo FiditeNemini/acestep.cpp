@@ -52,30 +52,7 @@ static std::vector<int> parse_codes_string(const std::string & s) {
     return codes;
 }
 
-struct AceSynth {
-    // Models (loaded once)
-    DiTGGML      dit;
-    Qwen3GGML    text_enc;
-    CondGGML     cond_enc;
-    VAEGGML      vae;
-    DetokGGML    detok;
-    TokGGML      tok;
-    BPETokenizer bpe;
-
-    // Metadata from DiT GGUF
-    bool               is_turbo;
-    std::vector<float> silence_full;  // [15000, 64] f32
-
-    // Config
-    AceSynthParams params;
-    bool           have_vae;
-    bool           have_detok;
-    bool           have_tok;
-
-    // Derived constants
-    int Oc;      // out_channels (64)
-    int ctx_ch;  // in_channels - Oc (128)
-};
+#include "pipeline-synth-impl.h"
 
 // ops_encode_src
 int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthState & s) {

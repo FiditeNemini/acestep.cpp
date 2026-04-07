@@ -13,6 +13,7 @@
 #include "fsq-tok.h"
 #include "gguf-weights.h"
 #include "philox.h"
+#include "pipeline-synth-impl.h"
 #include "pipeline-synth-ops.h"
 #include "qwen3-enc.h"
 #include "request.h"
@@ -28,31 +29,6 @@
 #include <random>
 #include <string>
 #include <vector>
-
-struct AceSynth {
-    // Models (loaded once)
-    DiTGGML      dit;
-    Qwen3GGML    text_enc;
-    CondGGML     cond_enc;
-    VAEGGML      vae;
-    DetokGGML    detok;
-    TokGGML      tok;
-    BPETokenizer bpe;
-
-    // Metadata from DiT GGUF
-    bool               is_turbo;
-    std::vector<float> silence_full;  // [15000, 64] f32
-
-    // Config
-    AceSynthParams params;
-    bool           have_vae;
-    bool           have_detok;
-    bool           have_tok;
-
-    // Derived constants
-    int Oc;      // out_channels (64)
-    int ctx_ch;  // in_channels - Oc (128)
-};
 
 void ace_synth_default_params(AceSynthParams * p) {
     p->text_encoder_path = NULL;
