@@ -100,6 +100,13 @@ def add_metadata(w, cfg, model_type):
         ]:
             if key in cfg:
                 w.add_uint32("acestep.%s" % key, cfg[key])
+        # XL models have separate encoder dimensions (2B models omit these)
+        for key in [
+            "encoder_hidden_size", "encoder_intermediate_size",
+            "encoder_num_attention_heads", "encoder_num_key_value_heads",
+        ]:
+            if key in cfg:
+                w.add_uint32("acestep.%s" % key, cfg[key])
         if cfg.get("is_turbo"):
             w.add_bool("acestep.is_turbo", True)
         levels = cfg.get("fsq_input_levels")
