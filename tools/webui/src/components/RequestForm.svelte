@@ -321,6 +321,12 @@
 		if (r.lora && loraList.includes(String(r.lora))) out.lora = String(r.lora);
 		const lora_scale = num(r.lora_scale);
 		if (lora_scale != null) out.lora_scale = lora_scale;
+		const repaint_strength = num(r.repaint_strength);
+		if (repaint_strength != null) out.repaint_strength = repaint_strength;
+		if (app.srcRangeStart != null) out.repainting_start = app.srcRangeStart;
+		if (app.srcRangeEnd != null) out.repainting_end = app.srcRangeEnd;
+		const peak_clip = num(r.peak_clip);
+		if (peak_clip != null) out.peak_clip = peak_clip;
 		return out;
 	}
 
