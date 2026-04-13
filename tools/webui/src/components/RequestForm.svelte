@@ -60,7 +60,7 @@
 	// DiT input indicators
 	let hasCodes = $derived(!!app.request.audio_codes?.trim() && app.srcSongId == null);
 	let hasSrc = $derived(app.srcSongId != null);
-	let hasRange = $derived(app.srcRangeStart >= 0 && app.srcRangeEnd > app.srcRangeStart);
+	let hasRange = $derived(app.srcRangeStart != null || app.srcRangeEnd != null);
 	let hasRef = $derived(app.refSongId != null);
 
 	// instrumental mode: checked when lyrics and language match the convention.
@@ -460,14 +460,10 @@
 				synthParams.lora = app.request.lora;
 			const loraScale = num(app.request.lora_scale);
 			if (loraScale != null) synthParams.lora_scale = loraScale;
-			// repaint/lego: inject range from source audio selection (optional for lego)
-			if (
-				(t === TASK_REPAINT || t === TASK_LEGO) &&
-				app.srcRangeStart >= 0 &&
-				app.srcRangeEnd > app.srcRangeStart
-			) {
-				synthParams.repainting_start = app.srcRangeStart;
-				synthParams.repainting_end = app.srcRangeEnd;
+			// repaint/lego: inject range (each field independent, backend handles defaults)
+			if (t === TASK_REPAINT || t === TASK_LEGO) {
+				if (app.srcRangeStart != null) synthParams.repainting_start = app.srcRangeStart;
+				if (app.srcRangeEnd != null) synthParams.repainting_end = app.srcRangeEnd;
 			}
 
 			// resolve seeds, build server payload and local expanded list for SongCard mapping.
@@ -566,6 +562,8 @@
 		app.request.repaint_strength = undefined;
 		app.request.infer_method = '';
 		app.request.seed = undefined;
+		app.srcRangeStart = null;
+		app.srcRangeEnd = null;
 	}
 
 	function ph(v: unknown): string {
@@ -906,6 +904,29 @@
 						type="text"
 						placeholder={ph(d?.repaint_strength)}
 						bind:value={app.request.repaint_strength}
+					/></label
+				>
+				<label
+					>Repaint start <input
+						type="text"
+						placeholder={ph(d?.repainting_start)}
+						value={app.srcRangeStart != null ? Math.round(app.srcRangeStart * 100) / 100 : ''}
+						oninput={(e) => {
+							const s = e.currentTarget.value.trim();
+							app.srcRangeStart =
+								s === '' ? null : isNaN(Number(s)) ? app.srcRangeStart : Number(s);
+						}}
+					/></label
+				>
+				<label
+					>Repaint end <input
+						type="text"
+						placeholder={ph(d?.repainting_end)}
+						value={app.srcRangeEnd != null ? Math.round(app.srcRangeEnd * 100) / 100 : ''}
+						oninput={(e) => {
+							const s = e.currentTarget.value.trim();
+							app.srcRangeEnd = s === '' ? null : isNaN(Number(s)) ? app.srcRangeEnd : Number(s);
+						}}
 					/></label
 				>
 				<label

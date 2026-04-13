@@ -55,8 +55,8 @@ export const app = $state({
 	pendingIndex: 0,
 	refSongId: null as number | null,
 	srcSongId: null as number | null,
-	srcRangeStart: -1,
-	srcRangeEnd: -1
+	srcRangeStart: null as number | null,
+	srcRangeEnd: null as number | null
 });
 
 let toastTimer = 0;
@@ -78,6 +78,8 @@ export function setRequest(incoming: AceRequest) {
 	if (!incoming.lora) incoming.lora = app.request.lora;
 	if (incoming.lora_scale == null) incoming.lora_scale = app.request.lora_scale;
 	app.request = incoming;
+	app.srcRangeStart = incoming.repainting_start ?? null;
+	app.srcRangeEnd = incoming.repainting_end ?? null;
 }
 
 // persist on every change

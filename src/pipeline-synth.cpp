@@ -431,8 +431,8 @@ int ace_synth_generate(AceSynth *         ctx,
     if (s.is_repaint || s.is_lego_region) {
         s.rs += s.left_pad_sec;
         if (s.re < 0.0f) {
-            // sentinel: default end = original source boundary in padded frame
-            s.re = (float) src_len / 48000.0f + s.left_pad_sec;
+            // sentinel: outpaint (start < 0) ends at source start, inpaint ends at source end
+            s.re = (s.rr.repainting_start < 0.0f) ? s.left_pad_sec : (float) src_len / 48000.0f + s.left_pad_sec;
         } else {
             s.re += s.left_pad_sec;
         }
