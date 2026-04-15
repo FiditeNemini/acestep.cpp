@@ -38,6 +38,7 @@ void ace_synth_default_params(AceSynthParams * p) {
     p->lora_scale        = 1.0f;
     p->use_fa            = true;
     p->clamp_fp16        = false;
+    p->use_batch_cfg     = true;
     p->vae_chunk         = 256;
     p->vae_overlap       = 64;
     p->dump_dir          = NULL;
@@ -193,6 +194,9 @@ AceSynth * ace_synth_load(const AceSynthParams * params) {
             ctx->dit.use_flash_attn ? "yes" : "no");
     if (params->clamp_fp16) {
         fprintf(stderr, "[Ace-Synth] FP16 clamp enabled\n");
+    }
+    if (!params->use_batch_cfg) {
+        fprintf(stderr, "[Ace-Synth] Batched DiT CFG disabled (split 2-pass forwards)\n");
     }
 
     return ctx;

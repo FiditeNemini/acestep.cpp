@@ -1231,7 +1231,7 @@ static void usage(const char * prog) {
             "Debug:\n"
             "  --no-fsm                Disable FSM constrained decoding\n"
             "  --no-fa                 Disable flash attention\n"
-            "  --no-batch-cfg          Split CFG into two N=1 forwards\n"
+            "  --no-batch-cfg          Split CFG into two separate forwards (LM + DiT)\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n",
             prog);
 }
@@ -1285,7 +1285,8 @@ int main(int argc, char ** argv) {
             g_lm_params.use_fa    = false;
             g_synth_params.use_fa = false;
         } else if (!strcmp(argv[i], "--no-batch-cfg")) {
-            g_lm_params.use_batch_cfg = false;
+            g_lm_params.use_batch_cfg    = false;
+            g_synth_params.use_batch_cfg = false;
         } else if (!strcmp(argv[i], "--clamp-fp16")) {
             g_lm_params.clamp_fp16    = true;
             g_synth_params.clamp_fp16 = true;

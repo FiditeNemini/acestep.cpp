@@ -679,7 +679,7 @@ Debug:
   --max-seq <N>          KV cache size (default: 8192)
   --no-fsm               Disable FSM constrained decoding
   --no-fa                Disable flash attention
-  --no-batch-cfg         Split CFG into two N=1 forwards
+  --no-batch-cfg         Split CFG into two separate forwards
   --clamp-fp16           Clamp hidden states to FP16 range
   --dump-logits <path>   Dump prefill logits (binary f32)
   --dump-tokens <path>   Dump prompt token IDs (CSV)
@@ -720,6 +720,7 @@ Memory control:
 
 Debug:
   --no-fa                 Disable flash attention
+  --no-batch-cfg          Split DiT CFG into two separate forwards
   --clamp-fp16            Clamp hidden states to FP16 range
   --dump <dir>            Dump intermediate tensors
 ```
@@ -804,7 +805,7 @@ Server:
 Debug:
   --no-fsm                Disable FSM constrained decoding
   --no-fa                 Disable flash attention
-  --no-batch-cfg          Split CFG into two N=1 forwards
+  --no-batch-cfg          Split CFG into two separate forwards (LM + DiT)
   --clamp-fp16            Clamp hidden states to FP16 range
 ```
 

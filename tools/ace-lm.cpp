@@ -24,7 +24,7 @@ static void usage(const char * prog) {
             "  --max-seq <N>          KV cache size (default: 8192)\n"
             "  --no-fsm               Disable FSM constrained decoding\n"
             "  --no-fa                Disable flash attention\n"
-            "  --no-batch-cfg         Split CFG into two N=1 forwards\n"
+            "  --no-batch-cfg         Split CFG into two separate forwards\n"
             "  --clamp-fp16           Clamp hidden states to FP16 range\n"
             "  --dump-logits <path>   Dump prefill logits (binary f32)\n"
             "  --dump-tokens <path>   Dump prompt token IDs (CSV)\n",
