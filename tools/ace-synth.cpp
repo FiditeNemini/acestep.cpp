@@ -247,22 +247,25 @@ int main(int argc, char ** argv) {
         ref_len = T_audio;
     }
 
-    // Build one group per original request (same codes = same T per group).
-    // synth_batch_size variations within a group share the same T, so they
-    // stack into a single GPU batch. Different requests can have different
-    // T -> they become separate groups and each gets its own DiT forward.
+    // Generate every request in one DiT batch. synth_batch_size expands each
+    // request into per-seed variants in groups[0]. Total clamped to DiT max 9.
     int total_alloc = 0;
     for (int ri = 0; ri < batch_n; ri++) {
         int sbs = reqs[ri].synth_batch_size;
         total_alloc += sbs < 1 ? 1 : (sbs > 9 ? 9 : sbs);
     }
+    if (total_alloc > 9) {
+        fprintf(stderr, "[Ace-Synth] Batch %d exceeds DiT max 9, clamping\n", total_alloc);
+        total_alloc = 9;
+    }
     std::vector<AceAudio>                all_audio(total_alloc);
     std::vector<std::string>             all_basenames(total_alloc);
     std::vector<int>                     all_synth_indices(total_alloc);
-    std::vector<std::vector<AceRequest>> groups(batch_n);
+    std::vector<std::vector<AceRequest>> groups(1);
+    groups[0].reserve(total_alloc);
 
     int off = 0;
-    for (int ri = 0; ri < batch_n; ri++) {
+    for (int ri = 0; ri < batch_n && off < total_alloc; ri++) {
         int sbs = reqs[ri].synth_batch_size;
         if (sbs < 1) {
             sbs = 1;
@@ -270,26 +273,26 @@ int main(int argc, char ** argv) {
         if (sbs > 9) {
             sbs = 9;
         }
+        if (off + sbs > total_alloc) {
+            sbs = total_alloc - off;
+        }
 
         // resolve seed once per original request
         request_resolve_seed(&reqs[ri]);
         const long long base_seed = reqs[ri].seed;
 
-        groups[ri].resize(sbs);
         for (int i = 0; i < sbs; i++) {
-            groups[ri][i]      = reqs[ri];
-            groups[ri][i].seed = base_seed + i;
-        }
-
-        if (batch_n > 1 || sbs > 1) {
-            fprintf(stderr, "[Ace-Synth] Group %d: %d track(s)\n", ri, sbs);
-        }
-
-        for (int i = 0; i < sbs; i++) {
+            AceRequest r = reqs[ri];
+            r.seed       = base_seed + i;
+            groups[0].push_back(r);
             all_basenames[off + i]     = basenames[ri];
             all_synth_indices[off + i] = i;
         }
         off += sbs;
+    }
+
+    if (total_alloc > 1) {
+        fprintf(stderr, "[Ace-Synth] Batch: %d track(s) from %d request(s)\n", total_alloc, batch_n);
     }
 
     // Two-phase run: DiT resident for all groups, then VAE for all jobs.

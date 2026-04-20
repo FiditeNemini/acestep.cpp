@@ -108,20 +108,20 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
 
 // Allocate job and init the SynthState fields every task poses the same way.
 static AceSynthJob * alloc_job(AceSynth * ctx, const AceRequest * reqs, int batch_n) {
-    AceSynthJob * job    = new AceSynthJob();
-    job->batch_n         = batch_n;
-    SynthState & s       = job->state;
-    s.Oc                 = ctx->Oc;
-    s.ctx_ch             = ctx->ctx_ch;
-    s.left_pad_sec       = 0.0f;
-    s.rr                 = reqs[0];
-    s.rs                 = s.rr.repainting_start;
-    s.re                 = s.rr.repainting_end;
-    s.use_sde            = (s.rr.infer_method == INFER_SDE);
-    s.is_repaint         = false;
-    s.is_lego_region     = false;
-    s.have_cover         = false;
-    s.T_cover            = 0;
+    AceSynthJob * job = new AceSynthJob();
+    job->batch_n      = batch_n;
+    SynthState & s    = job->state;
+    s.Oc              = ctx->Oc;
+    s.ctx_ch          = ctx->ctx_ch;
+    s.left_pad_sec    = 0.0f;
+    s.rr              = reqs[0];
+    s.rs              = s.rr.repainting_start;
+    s.re              = s.rr.repainting_end;
+    s.use_sde         = (s.rr.infer_method == INFER_SDE);
+    s.is_repaint      = false;
+    s.is_lego_region  = false;
+    s.have_cover      = false;
+    s.T_cover         = 0;
     debug_init(&s.dbg, ctx->params.dump_dir);
     return job;
 }

@@ -5,10 +5,12 @@
 // and catches regressions in eviction or refcounting logic.
 //
 // Usage:
-//   ./test-model-store --lm <gguf> --dit <gguf> --vae <gguf>
+//   ./test-model-store --models <dir>
 //
-// All three paths are required. Uses small Q8 GGUFs in practice.
+// Scans the registry exactly like the CLI binaries and picks the first entry
+// of each bucket (LM, DiT, VAE).
 
+#include "model-registry.h"
 #include "model-store.h"
 #include "pipeline-lm.h"
 #include "pipeline-understand.h"
@@ -318,7 +320,7 @@ static int scenario_refcount(const char * vae_path) {
 //
 // We simulate the exact propagation block from ace-server main() and compare
 // the two keys by hand. The test must fail loudly when keys drift.
-static int scenario_integration(const char * lm_path) {
+static int scenario_integration(const char * lm_path, const char * dit_path, const char * vae_path) {
     fprintf(stderr, "[Test] scenario 7: ace-server integration\n");
     ModelStore * s = store_create(EVICT_NEVER);
 
@@ -331,6 +333,8 @@ static int scenario_integration(const char * lm_path) {
     AceUnderstandParams und_p;
     ace_understand_default_params(&und_p);
     und_p.model_path = lm_path;
+    und_p.dit_path   = dit_path;
+    und_p.vae_path   = vae_path;
     // Replicate ace-server main() propagation. Every LM-key field must land here.
     und_p.max_seq    = lm_p.max_seq;
     und_p.max_batch  = lm_p.max_batch;
@@ -380,30 +384,61 @@ static int scenario_integration(const char * lm_path) {
     return 0;
 }
 
-int main(int argc, char ** argv) {
+static void usage(const char * prog) {
     fprintf(stderr, "acestep.cpp %s\n\n", ACE_VERSION);
+    fprintf(stderr,
+            "Usage: %s --models <dir>\n"
+            "\n"
+            "Required:\n"
+            "  --models <dir>          Directory of GGUF model files\n",
+            prog);
+}
 
-    const char * lm_path  = nullptr;
-    const char * dit_path = nullptr;
-    const char * vae_path = nullptr;
+int main(int argc, char ** argv) {
+    const char * models_dir = nullptr;
+
+    if (argc < 2) {
+        usage(argv[0]);
+        return 1;
+    }
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--lm") && i + 1 < argc) {
-            lm_path = argv[++i];
-        } else if (!strcmp(argv[i], "--dit") && i + 1 < argc) {
-            dit_path = argv[++i];
-        } else if (!strcmp(argv[i], "--vae") && i + 1 < argc) {
-            vae_path = argv[++i];
+        if (!strcmp(argv[i], "--models") && i + 1 < argc) {
+            models_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            usage(argv[0]);
+            return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
             return 1;
         }
     }
 
-    if (!lm_path || !dit_path || !vae_path) {
-        fprintf(stderr, "Usage: %s --lm <gguf> --dit <gguf> --vae <gguf>\n", argv[0]);
+    if (!models_dir) {
+        fprintf(stderr, "[CLI] ERROR: --models required\n");
+        usage(argv[0]);
         return 1;
     }
+
+    // Registry scan: one place to resolve all three GGUF paths, exactly like
+    // the CLI binaries. The test is itself a user of the registry API, so any
+    // drift there breaks scenario 7 just as it would break ace-server.
+    ModelRegistry registry;
+    if (!registry_scan(&registry, models_dir)) {
+        fprintf(stderr, "[Test] FATAL: cannot scan --models %s\n", models_dir);
+        return 1;
+    }
+    if (registry.lm.empty() || registry.dit.empty() || registry.vae.empty()) {
+        fprintf(stderr, "[Test] FATAL: registry needs LM, DiT and VAE models under %s\n", models_dir);
+        return 1;
+    }
+
+    const char * lm_path  = registry.lm[0].path.c_str();
+    const char * dit_path = registry.dit[0].path.c_str();
+    const char * vae_path = registry.vae[0].path.c_str();
+
+    fprintf(stderr, "[Test] LM=%s DiT=%s VAE=%s\n", lm_path, dit_path, vae_path);
 
     int rc = 0;
     rc |= scenario_strict(lm_path, dit_path, vae_path);
@@ -412,7 +447,7 @@ int main(int argc, char ** argv) {
     rc |= scenario_lm_sharing(lm_path);
     rc |= scenario_kind_split(vae_path);
     rc |= scenario_refcount(vae_path);
-    rc |= scenario_integration(lm_path);
+    rc |= scenario_integration(lm_path, dit_path, vae_path);
 
     if (rc == 0) {
         fprintf(stderr, "[Test] ALL PASS\n");

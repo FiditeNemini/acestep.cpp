@@ -570,14 +570,17 @@ static void synth_worker(std::shared_ptr<Job>    job,
                          bool                    output_wav,
                          WavFormat               wav_fmt,
                          int                     peak_clip) {
-    // One group per original request: same codes = same T per group, so the
-    // synth_batch_size copies inside a group stack into a single GPU batch.
-    // Different requests can have different T and become separate groups.
+    // Generate every request in one DiT batch. synth_batch_size expands each
+    // request into per-seed variants. Total clamped to DiT max 9.
     const int batch_n     = (int) ace_reqs.size();
     int       total_alloc = 0;
     for (int ri = 0; ri < batch_n; ri++) {
         int sbs = ace_reqs[ri].synth_batch_size;
         total_alloc += sbs < 1 ? 1 : (sbs > 9 ? 9 : sbs);
+    }
+    if (total_alloc > 9) {
+        fprintf(stderr, "[Server] Batch %d exceeds DiT max 9, clamping\n", total_alloc);
+        total_alloc = 9;
     }
     std::vector<AceAudio> audio(total_alloc);
 
@@ -636,9 +639,12 @@ static void synth_worker(std::shared_ptr<Job>    job,
         return;
     }
 
-    // Build per-request groups with resolved seeds.
-    std::vector<std::vector<AceRequest>> groups(batch_n);
-    for (int ri = 0; ri < batch_n; ri++) {
+    // Build the flat batch. Seeds are resolved per original request, then
+    // synth_batch_size is expanded into per-seed variants in groups[0].
+    std::vector<std::vector<AceRequest>> groups(1);
+    groups[0].reserve(total_alloc);
+    int off = 0;
+    for (int ri = 0; ri < batch_n && off < total_alloc; ri++) {
         auto & r   = ace_reqs[ri];
         int    sbs = r.synth_batch_size;
         if (sbs < 1) {
@@ -647,14 +653,22 @@ static void synth_worker(std::shared_ptr<Job>    job,
         if (sbs > 9) {
             sbs = 9;
         }
+        if (off + sbs > total_alloc) {
+            sbs = total_alloc - off;
+        }
         request_resolve_seed(&r);
         const long long base_seed = r.seed;
 
-        groups[ri].resize(sbs);
         for (int i = 0; i < sbs; i++) {
-            groups[ri][i]      = r;
-            groups[ri][i].seed = base_seed + i;
+            AceRequest v = r;
+            v.seed       = base_seed + i;
+            groups[0].push_back(v);
         }
+        off += sbs;
+    }
+
+    if (total_alloc > 1) {
+        fprintf(stderr, "[Server] Batch: %d track(s) from %d request(s)\n", total_alloc, batch_n);
     }
 
     // Two-phase run. The store acquires and releases GPU modules around each

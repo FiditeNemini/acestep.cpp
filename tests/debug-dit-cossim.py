@@ -484,7 +484,7 @@ def main():
                     help="which model to test (default: turbo)")
     ap.add_argument("--quant", default="BF16",
                     help="quantization suffix for GGUF (default: BF16, e.g. Q6_K, Q8_0)")
-    ap.add_argument("--adapter", default=None,
+    ap.add_argument("--adapters", default=None,
                     help="path to adapter directory (optional)")
     args = ap.parse_args()
 
@@ -499,7 +499,7 @@ def main():
             print(f"[Error] GGUF not found: {gguf_path}")
             ok = False
             continue
-        if not run_mode(m, cfg, req, gguf_path, args.adapter):
+        if not run_mode(m, cfg, req, gguf_path, args.adapters):
             ok = False
 
     return 0 if ok else 1
