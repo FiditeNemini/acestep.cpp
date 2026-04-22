@@ -9,3 +9,9 @@ endif()
 add_executable(test-model-store test-model-store.cpp)
 target_link_libraries(test-model-store PRIVATE acestep-core)
 link_ggml_backends(test-model-store)
+
+# test-lm-prompt: byte for byte check of Phase 2 LM prompt builders
+# against the Qwen3 chat template reference.
+add_executable(test-lm-prompt test-lm-prompt.cpp)
+target_link_libraries(test-lm-prompt PRIVATE acestep-core)
+link_ggml_backends(test-lm-prompt)
