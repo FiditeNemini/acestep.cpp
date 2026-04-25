@@ -59,8 +59,9 @@ struct SynthState {
     int                T_cover;
 
     // outpainting: silence padding for repaint beyond source bounds
-    float              left_pad_sec;  // seconds of silence prepended (coordinate shift)
-    std::vector<float> padded_src;    // interleaved stereo buffer with silence padding
+    float              left_pad_sec;    // seconds of silence prepended (coordinate shift)
+    std::vector<float> padded_src;      // interleaved stereo buffer with silence padding (audio path)
+    std::vector<float> padded_latents;  // [T_padded, 64] f32 with silence_full padding (latent path)
 
     // mode flags
     bool  is_repaint;

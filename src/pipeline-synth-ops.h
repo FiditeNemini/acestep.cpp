@@ -59,14 +59,12 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
 
 // Phase 2 primitive.
 
-// VAE decode all batch items + waveform splice for repaint/lego regions.
-// src_audio is interleaved PCM for splice (padded for outpainting).
+// Latent splice for repaint/lego (kept generated frames inside [t0, t1),
+// source latents elsewhere) followed by VAE decode for every batch item.
 // Returns 0 on success, -1 on error/cancel.
-int ops_vae_decode_and_splice(const AceSynth * ctx,
-                              int              batch_n,
-                              AceAudio *       out,
-                              SynthState &     s,
-                              const float *    src_audio,
-                              int              src_len,
-                              bool (*cancel)(void *),
-                              void * cancel_data);
+int ops_vae_decode(const AceSynth * ctx,
+                   int              batch_n,
+                   AceAudio *       out,
+                   SynthState &     s,
+                   bool (*cancel)(void *),
+                   void * cancel_data);

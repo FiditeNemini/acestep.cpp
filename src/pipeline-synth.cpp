@@ -128,46 +128,84 @@ static AceSynthJob * alloc_job(AceSynth * ctx, const AceRequest * reqs, int batc
 
 // Outpainting: pad src_audio with silence when the region extends beyond
 // source bounds. Returns the (possibly padded) buffer and length via out
-// params; writes s.padded_src and s.left_pad_sec when padding applies.
-static void apply_outpainting_padding(const AceRequest & r,
+// Pad source for outpainting when the region extends beyond the source bounds.
+// Audio path: zero-pads s.padded_src in samples, the VAE encoder will turn
+// silence audio into ~silence latents.
+// Latent path: pads s.cover_latents directly with the precomputed silence_full
+// latent (the canonical VAE encoding of audio silence). No VAE encode needed.
+// Sets s.left_pad_sec for adjust_region_coords.
+static void apply_outpainting_padding(const AceSynth *   ctx,
+                                      const AceRequest & r,
                                       const float *      src_audio,
                                       int                src_len,
+                                      const float *      src_latents,
+                                      int                src_T_latent,
                                       SynthState &       s,
                                       const float *&     enc_audio,
-                                      int &              enc_len) {
-    enc_audio = src_audio;
-    enc_len   = src_len;
-    if (!src_audio || src_len <= 0) {
-        return;
-    }
-    float src_dur  = (float) src_len / 48000.0f;
+                                      int &              enc_len,
+                                      const float *&     enc_latents,
+                                      int &              enc_T_latent) {
+    enc_audio    = src_audio;
+    enc_len      = src_len;
+    enc_latents  = src_latents;
+    enc_T_latent = src_T_latent;
+
+    float src_dur =
+        (src_latents && src_T_latent > 0) ? (float) src_T_latent * 1920.0f / 48000.0f : (float) src_len / 48000.0f;
     float rs_raw   = r.repainting_start;
     float re_raw   = r.repainting_end;
     float end_time = (re_raw < 0.0f) ? src_dur : re_raw;
     float lpad     = (rs_raw < 0.0f) ? -rs_raw : 0.0f;
     float rpad     = (end_time > src_dur) ? end_time - src_dur : 0.0f;
-    if (lpad <= 0.0f && rpad <= 0.0f) {
+    s.left_pad_sec = lpad;
+
+    if (src_latents && src_T_latent > 0) {
+        if (lpad <= 0.0f && rpad <= 0.0f) {
+            return;
+        }
+        // Latent pad: round to 25Hz frames, splice silence_full at the edges.
+        int           lpad_T  = (int) (lpad * 25.0f + 0.5f);
+        int           rpad_T  = (int) (rpad * 25.0f + 0.5f);
+        int           total_T = lpad_T + src_T_latent + rpad_T;
+        const float * sil     = ctx->meta->silence_full.data();
+        s.padded_latents.resize((size_t) total_T * 64);
+        memcpy(s.padded_latents.data(), sil, (size_t) lpad_T * 64 * sizeof(float));
+        memcpy(s.padded_latents.data() + (size_t) lpad_T * 64, src_latents, (size_t) src_T_latent * 64 * sizeof(float));
+        memcpy(s.padded_latents.data() + (size_t) (lpad_T + src_T_latent) * 64, sil,
+               (size_t) rpad_T * 64 * sizeof(float));
+        enc_latents  = s.padded_latents.data();
+        enc_T_latent = total_T;
+        fprintf(stderr, "[Outpaint] latent pad left=%.1fs (%d) right=%.1fs (%d) total=%.1fs\n", lpad, lpad_T, rpad,
+                rpad_T, (float) total_T * 1920.0f / 48000.0f);
         return;
     }
+
+    // Audio path: always populate s.padded_src so the post-decode waveform
+    // splice always has the source PCM to read from, with or without outpaint.
     int lpad_s       = (int) (lpad * 48000.0f);
     int rpad_s       = (int) (rpad * 48000.0f);
     int padded_total = src_len + lpad_s + rpad_s;
     s.padded_src.resize((size_t) padded_total * 2);
-    memset(s.padded_src.data(), 0, s.padded_src.size() * sizeof(float));
+    if (lpad_s > 0 || rpad_s > 0) {
+        memset(s.padded_src.data(), 0, s.padded_src.size() * sizeof(float));
+    }
     memcpy(s.padded_src.data() + (size_t) lpad_s * 2, src_audio, (size_t) src_len * 2 * sizeof(float));
-    s.left_pad_sec = lpad;
-    enc_audio      = s.padded_src.data();
-    enc_len        = padded_total;
-    fprintf(stderr, "[Outpaint] pad left=%.1fs right=%.1fs total=%.1fs\n", lpad, rpad, (float) padded_total / 48000.0f);
+    enc_audio = s.padded_src.data();
+    enc_len   = padded_total;
+    if (lpad > 0.0f || rpad > 0.0f) {
+        fprintf(stderr, "[Outpaint] audio pad left=%.1fs right=%.1fs total=%.1fs\n", lpad, rpad,
+                (float) padded_total / 48000.0f);
+    }
 }
 
 // Shift region coords into the padded reference frame, resolve sentinel end
 // (-1) to either left pad boundary (outpaint) or source end (inpaint).
-// Returns false when the resolved range is empty or inverted.
-static bool adjust_region_coords(SynthState & s, int src_len) {
+// src_dur is the unpadded source duration in seconds, agnostic of audio vs
+// latent input. Returns false when the resolved range is empty or inverted.
+static bool adjust_region_coords(SynthState & s, float src_dur) {
     s.rs += s.left_pad_sec;
     if (s.re < 0.0f) {
-        s.re = (s.rr.repainting_start < 0.0f) ? s.left_pad_sec : (float) src_len / 48000.0f + s.left_pad_sec;
+        s.re = (s.rr.repainting_start < 0.0f) ? s.left_pad_sec : src_dur + s.left_pad_sec;
     } else {
         s.re += s.left_pad_sec;
     }
@@ -379,11 +417,10 @@ static AceSynthJob * run_cover_nofsq(AceSynth *         ctx,
     return job;
 }
 
-// repaint: region-bounded inpaint/outpaint. Source audio is padded with
-// silence when the region extends beyond its bounds. The DiT regenerates
-// inside the region, phase 2 wav-splices the result back into the source.
-// Latents-only input is not supported: outpainting needs raw audio to pad
-// and the phase-2 splice rebuilds the waveform around the regenerated zone.
+// repaint: region-bounded inpaint/outpaint. Source padded with silence at the
+// edges when the region extends beyond bounds, audio-side or latent-side
+// depending on what the caller provided. DiT regenerates inside the region,
+// phase 2 splices the result with the source latents and decodes once.
 static AceSynthJob * run_repaint(AceSynth *         ctx,
                                  const AceRequest * reqs,
                                  const float *      src_audio,
@@ -397,14 +434,10 @@ static AceSynthJob * run_repaint(AceSynth *         ctx,
                                  int                batch_n,
                                  bool (*cancel)(void *),
                                  void * cancel_data) {
-    if (src_latents && src_T_latent > 0) {
-        fprintf(stderr,
-                "[Synth-Run] ERROR: task 'repaint' requires src_audio (outpainting and splice), src_latents not "
-                "supported\n");
-        return NULL;
-    }
-    if (!src_audio || src_len <= 0) {
-        fprintf(stderr, "[Synth-Run] ERROR: task 'repaint' requires source audio\n");
+    bool have_audio   = src_audio && src_len > 0;
+    bool have_latents = src_latents && src_T_latent > 0;
+    if (!have_audio && !have_latents) {
+        fprintf(stderr, "[Synth-Run] ERROR: task 'repaint' requires source audio or src_latents\n");
         return NULL;
     }
     AceSynthJob * job    = alloc_job(ctx, reqs, batch_n);
@@ -413,16 +446,20 @@ static AceSynthJob * run_repaint(AceSynth *         ctx,
     s.use_source_context = true;
     s.instruction_str    = DIT_INSTR_REPAINT;
 
-    const float * enc_audio = NULL;
-    int           enc_len   = 0;
-    apply_outpainting_padding(reqs[0], src_audio, src_len, s, enc_audio, enc_len);
+    const float * enc_audio    = NULL;
+    int           enc_len      = 0;
+    const float * enc_latents  = NULL;
+    int           enc_T_latent = 0;
+    apply_outpainting_padding(ctx, reqs[0], src_audio, src_len, src_latents, src_T_latent, s, enc_audio, enc_len,
+                              enc_latents, enc_T_latent);
 
-    if (!pinned_encode_src_and_timbre(ctx, enc_audio, enc_len, NULL, 0, ref_audio, ref_len, ref_latents, ref_T_latent,
-                                      s)) {
+    if (!pinned_encode_src_and_timbre(ctx, enc_audio, enc_len, enc_latents, enc_T_latent, ref_audio, ref_len,
+                                      ref_latents, ref_T_latent, s)) {
         delete job;
         return NULL;
     }
-    if (!adjust_region_coords(s, src_len)) {
+    float src_dur = have_latents ? (float) src_T_latent * 1920.0f / 48000.0f : (float) src_len / 48000.0f;
+    if (!adjust_region_coords(s, src_dur)) {
         delete job;
         return NULL;
     }
@@ -436,8 +473,8 @@ static AceSynthJob * run_repaint(AceSynth *         ctx,
 // lego: stem generation. With valid rs/re: region-constrained, DiT generates
 // only in the zone with full audio context. Without: whole-song generation.
 // audio_cover_strength forced to 1.0 so all DiT steps hear the backing track.
-// Latents-only input is not supported: in region mode outpainting needs raw
-// audio, and phase-2 splice rebuilds the waveform around the generated stem.
+// Both src_audio and src_latents are accepted; in region mode the source is
+// padded with silence at the edges when the region extends beyond bounds.
 static AceSynthJob * run_lego(AceSynth *         ctx,
                               const AceRequest * reqs,
                               const float *      src_audio,
@@ -451,14 +488,10 @@ static AceSynthJob * run_lego(AceSynth *         ctx,
                               int                batch_n,
                               bool (*cancel)(void *),
                               void * cancel_data) {
-    if (src_latents && src_T_latent > 0) {
-        fprintf(
-            stderr,
-            "[Synth-Run] ERROR: task 'lego' requires src_audio (outpainting and splice), src_latents not supported\n");
-        return NULL;
-    }
-    if (!src_audio || src_len <= 0) {
-        fprintf(stderr, "[Synth-Run] ERROR: task 'lego' requires source audio\n");
+    bool have_audio   = src_audio && src_len > 0;
+    bool have_latents = src_latents && src_T_latent > 0;
+    if (!have_audio && !have_latents) {
+        fprintf(stderr, "[Synth-Run] ERROR: task 'lego' requires source audio or src_latents\n");
         return NULL;
     }
     AceSynthJob * job       = alloc_job(ctx, reqs, batch_n);
@@ -470,18 +503,22 @@ static AceSynthJob * run_lego(AceSynth *         ctx,
     fprintf(stderr, "[Synth-Run] task=%s\n", reqs[0].task_type.c_str());
     warn_if_turbo_stem(ctx, "lego");
 
-    const float * enc_audio = src_audio;
-    int           enc_len   = src_len;
+    const float * enc_audio    = src_audio;
+    int           enc_len      = src_len;
+    const float * enc_latents  = src_latents;
+    int           enc_T_latent = src_T_latent;
     if (s.is_lego_region) {
-        apply_outpainting_padding(reqs[0], src_audio, src_len, s, enc_audio, enc_len);
+        apply_outpainting_padding(ctx, reqs[0], src_audio, src_len, src_latents, src_T_latent, s, enc_audio, enc_len,
+                                  enc_latents, enc_T_latent);
     }
 
-    if (!pinned_encode_src_and_timbre(ctx, enc_audio, enc_len, NULL, 0, ref_audio, ref_len, ref_latents, ref_T_latent,
-                                      s)) {
+    if (!pinned_encode_src_and_timbre(ctx, enc_audio, enc_len, enc_latents, enc_T_latent, ref_audio, ref_len,
+                                      ref_latents, ref_T_latent, s)) {
         delete job;
         return NULL;
     }
-    if (s.is_lego_region && !adjust_region_coords(s, src_len)) {
+    float src_dur = have_latents ? (float) src_T_latent * 1920.0f / 48000.0f : (float) src_len / 48000.0f;
+    if (s.is_lego_region && !adjust_region_coords(s, src_dur)) {
         delete job;
         return NULL;
     }
@@ -629,24 +666,16 @@ const float * ace_synth_job_get_latent(const AceSynthJob * job, int track_idx, i
     return s.output.data() + (size_t) track_idx * s.T * s.Oc;
 }
 
-// Phase 2: VAE decode all batch items and apply waveform splice for
-// repaint/lego regions. Picks the padded source when the job carried one.
+// Phase 2: latent splice (for repaint/lego) + VAE decode for every batch item.
 int ace_synth_job_run_vae(AceSynth *    ctx,
                           AceSynthJob * job,
-                          const float * splice_src,
-                          int           splice_len,
                           AceAudio *    out,
                           bool (*cancel)(void *),
                           void * cancel_data) {
     if (!ctx || !job || !out) {
         return -1;
     }
-
-    // Outpainting: splice uses the padded source (silence at extended boundaries).
-    const float * sp_audio = job->state.padded_src.empty() ? splice_src : job->state.padded_src.data();
-    int           sp_len   = job->state.padded_src.empty() ? splice_len : (int) (job->state.padded_src.size() / 2);
-
-    return ops_vae_decode_and_splice(ctx, job->batch_n, out, job->state, sp_audio, sp_len, cancel, cancel_data);
+    return ops_vae_decode(ctx, job->batch_n, out, job->state, cancel, cancel_data);
 }
 
 void ace_synth_job_free(AceSynthJob * job) {

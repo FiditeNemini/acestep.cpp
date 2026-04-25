@@ -443,11 +443,10 @@ Two mechanisms do the work when a repaint region is active:
    DiT was trained on this exact shape and natively regenerates the silenced
    zone. Flow matching runs as a generic denoising loop, unaware of repaint.
 
-2. **Waveform splice** (post-VAE decode): replaces non-region audio samples
-   with the original PCM from `src_audio` (interleaved input), with a fixed
-   10ms linear crossfade at zone edges. Guarantees bit-exact preservation
-   outside the zone (no VAE roundtrip), critical for mastering-grade use.
-   Skipped if region covers the full duration.
+2. **Latent splice** (pre-VAE decode): keeps the DiT-generated frames inside
+   [t0, t1) and copies the source latents elsewhere (hard cut at frame
+   boundary). Single VAE decode produces the final audio. No crossfade: the
+   tiled VAE decoder smooths the seam in the waveform on its own.
 
 Key difference repaint vs lego: repaint silences the zone in the DiT context
 src (so the DiT generates fresh content there). Lego keeps the full backing

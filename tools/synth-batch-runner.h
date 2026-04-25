@@ -85,11 +85,10 @@ static int synth_batch_run(AceSynth *                             ctx,
         }
     }
 
-    // Phase 2: VAE decode for each job. The decoder is acquired and released
-    // by ops_vae_decode_and_splice inside ace_synth_job_run_vae.
+    // Phase 2: latent splice + VAE decode for each job. The decoder is
+    // acquired and released by ops_vae_decode inside ace_synth_job_run_vae.
     for (int g = 0; g < n_groups; g++) {
-        const int rc =
-            ace_synth_job_run_vae(ctx, jobs[g], src_audio, src_len, audio_out + audio_off[g], cancel, cancel_data);
+        const int rc = ace_synth_job_run_vae(ctx, jobs[g], audio_out + audio_off[g], cancel, cancel_data);
         ace_synth_job_free(jobs[g]);
         jobs[g] = nullptr;
         if (rc != 0) {

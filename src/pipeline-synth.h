@@ -82,17 +82,14 @@ AceSynthJob * ace_synth_job_run_dit(AceSynth *         ctx,
 // reproduces the track's output audio. *T_out is set to T_latent.
 const float * ace_synth_job_get_latent(const AceSynthJob * job, int track_idx, int * T_out);
 
-// Phase 2: VAE decode and waveform splice. Acquires the VAE decoder and FSQ
-// detokenizer from the store; in STRICT this evicts the DiT from phase 1
-// transparently.
-// splice_src / splice_len: interleaved stereo source reused for repaint/lego wave splicing.
-//   Pass NULL when the job did not carry a source audio.
+// Phase 2: latent splice (for repaint/lego) + VAE decode. Acquires the VAE
+// decoder from the store; in STRICT this evicts the DiT from phase 1
+// transparently. The splice happens in latent space using s.cover_latents
+// captured during phase 1, no source audio is needed.
 // out[batch_n] allocated by caller, filled with audio buffers.
 // Returns 0 on success, -1 on error or cancellation.
 int ace_synth_job_run_vae(AceSynth *    ctx,
                           AceSynthJob * job,
-                          const float * splice_src,
-                          int           splice_len,
                           AceAudio *    out,
                           bool (*cancel)(void *) = nullptr,
                           void * cancel_data     = nullptr);
