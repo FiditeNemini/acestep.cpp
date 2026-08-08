@@ -547,14 +547,16 @@ static std::string resolve_name(const std::vector<ModelEntry> & bucket,
 }
 
 // LM worker: generates metadata + lyrics + codes, stores JSON result in job.
-static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch_size, int mode) {
+static void lm_worker(std::shared_ptr<Job> job, std::vector<AceRequest> ace_reqs, int mode) {
     if (job->cancel.load()) {
         job->status.store(JobStatus::CANCELLED);
         return;
     }
 
+    const int N = (int) ace_reqs.size();
+
     // Resolve model name and build per-request params from the template.
-    std::string        lm_name = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
+    std::string        lm_name = resolve_name(g_registry.lm, ace_reqs[0].lm_model, g_loaded_lm);
     const ModelEntry * entry   = registry_find(g_registry.lm, lm_name.c_str());
     if (!entry) {
         fprintf(stderr, "[Server] LM not found: %s\n", lm_name.c_str());
@@ -576,9 +578,9 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
 
     // Execute and always free the ctx, success or failure: the store decides
     // whether the underlying GPU module stays resident.
-    std::vector<AceRequest> out(lm_batch_size);
-    int rc = ace_lm_generate(ctx, &ace_req, lm_batch_size, out.data(), NULL, NULL, server_cancel_job,
-                             (void *) &job->cancel, mode);
+    std::vector<AceRequest> out(N);
+    int rc = ace_lm_generate(ctx, ace_reqs.data(), N, out.data(), NULL, NULL, server_cancel_job, (void *) &job->cancel,
+                             mode);
     ace_lm_free(ctx);
 
     if (rc != 0) {
@@ -596,7 +598,7 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
 
     // serialize output as a JSON array
     std::string body = "[";
-    for (int i = 0; i < lm_batch_size; i++) {
+    for (int i = 0; i < N; i++) {
         if (i > 0) {
             body += ",";
         }
@@ -607,13 +609,16 @@ static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch
     job->result_body = std::move(body);
     job->result_mime = "application/json";
     job->status.store(JobStatus::DONE);
-    fprintf(stderr, "[Server] Job %s done (LM, %d results)\n", job->id.c_str(), lm_batch_size);
+    fprintf(stderr, "[Server] Job %s done (LM, %d results)\n", job->id.c_str(), N);
 }
 
 // POST /lm
-// accepts: AceRequest JSON (lm_mode in the body selects the generation mode).
+// accepts: AceRequest JSON or [AceRequest, ...] (lm_mode selects the mode).
+// A single request expands into lm_batch_size seed variants of one prompt.
+// An array submits independent requests generated once each in one GPU
+// batch; items must share lm_mode and lm_model, lm_batch_size is ignored.
 // returns: JSON {"id":"N"} immediately. result is a JSON array of enriched
-// AceRequests (lm_batch_size controls count).
+// AceRequests, one per generated variant or array item.
 // modes (AceRequest.lm_mode):
 //   generate  metadata + lyrics + audio_codes  (full composer pass)
 //   inspire   metadata + lyrics                (audio_codes stays empty)
@@ -624,45 +629,71 @@ static void handle_lm(const httplib::Request & req, httplib::Response & res) {
         return;
     }
 
-    // parse request
-    AceRequest ace_req;
-    if (!request_parse_json(&ace_req, req.body.c_str())) {
+    // parse request: single object {} or array [{}, ...]
+    std::vector<AceRequest> ace_reqs;
+    if (!request_parse_json_array(req.body.c_str(), &ace_reqs)) {
         json_error(res, 400, "Invalid JSON");
         return;
     }
-    if (ace_req.caption.empty()) {
-        json_error(res, 400, "Caption is required");
+    if ((int) ace_reqs.size() > g_max_batch) {
+        json_error(res, 400, "Request array exceeds max_batch");
         return;
+    }
+    for (size_t i = 0; i < ace_reqs.size(); i++) {
+        if (ace_reqs[i].caption.empty()) {
+            json_error(res, 400, "Caption is required");
+            return;
+        }
+        if (i > 0 && (ace_reqs[i].lm_mode != ace_reqs[0].lm_mode || ace_reqs[i].lm_model != ace_reqs[0].lm_model)) {
+            json_error(res, 400, "Array items must share lm_mode and lm_model");
+            return;
+        }
     }
 
     // Resolve lm_mode string to integer mode used by ace_lm_generate.
     int mode;
-    if (ace_req.lm_mode == LM_MODE_NAME_GENERATE) {
+    if (ace_reqs[0].lm_mode == LM_MODE_NAME_GENERATE) {
         mode = LM_MODE_GENERATE;
-    } else if (ace_req.lm_mode == LM_MODE_NAME_INSPIRE) {
+    } else if (ace_reqs[0].lm_mode == LM_MODE_NAME_INSPIRE) {
         mode = LM_MODE_INSPIRE;
-    } else if (ace_req.lm_mode == LM_MODE_NAME_FORMAT) {
+    } else if (ace_reqs[0].lm_mode == LM_MODE_NAME_FORMAT) {
         mode = LM_MODE_FORMAT;
     } else {
         json_error(res, 400, "Invalid lm_mode (use: generate, inspire, format)");
         return;
     }
 
-    // clamp lm_batch_size to [1, max_batch]
-    int lm_batch_size = ace_req.lm_batch_size;
-    if (lm_batch_size < 1) {
-        lm_batch_size = 1;
-    }
-    if (lm_batch_size > g_max_batch) {
-        lm_batch_size = g_max_batch;
+    if (ace_reqs.size() == 1) {
+        // Single request: expand into lm_batch_size seed variants of one
+        // prompt, clamped to [1, max_batch]. The pipeline detects the shared
+        // prompt and prefills once.
+        int lm_batch_size = ace_reqs[0].lm_batch_size;
+        if (lm_batch_size < 1) {
+            lm_batch_size = 1;
+        }
+        if (lm_batch_size > g_max_batch) {
+            lm_batch_size = g_max_batch;
+        }
+        AceRequest base = ace_reqs[0];
+        request_resolve_lm_seed(&base);
+        request_resolve_seed(&base);
+        ace_reqs.assign(lm_batch_size, base);
+        for (int b = 0; b < lm_batch_size; b++) {
+            ace_reqs[b].lm_seed = base.lm_seed + b;
+            ace_reqs[b].seed    = base.seed + b;
+        }
+    } else {
+        // Array request: each item is generated once with its own seeds.
+        for (auto & r : ace_reqs) {
+            request_resolve_lm_seed(&r);
+            request_resolve_seed(&r);
+        }
     }
 
     auto job = job_create();
-    fprintf(stderr, "[Server] Job %s created (LM, mode=%d)\n", job->id.c_str(), mode);
+    fprintf(stderr, "[Server] Job %s created (LM, mode=%d, N=%zu)\n", job->id.c_str(), mode, ace_reqs.size());
 
-    request_resolve_lm_seed(&ace_req);
-
-    work_push([job, ace_req, lm_batch_size, mode]() { lm_worker(job, ace_req, lm_batch_size, mode); });
+    work_push([job, reqs = std::move(ace_reqs), mode]() mutable { lm_worker(job, std::move(reqs), mode); });
 
     std::string body = "{\"id\":\"" + job->id + "\"}";
     res.set_content(body, "application/json");

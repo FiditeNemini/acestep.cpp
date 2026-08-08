@@ -150,10 +150,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Generate
+    // Generate: expand into lm_batch_size seed variants of the request
     request_resolve_lm_seed(&req);
+    request_resolve_seed(&req);
+    std::vector<AceRequest> reqs(lm_batch_size, req);
+    for (int b = 0; b < lm_batch_size; b++) {
+        reqs[b].lm_seed = req.lm_seed + b;
+        reqs[b].seed    = req.seed + b;
+    }
     std::vector<AceRequest> out(lm_batch_size);
-    if (ace_lm_generate(ctx, &req, lm_batch_size, out.data(), dump_logits, dump_tokens, NULL, NULL, mode) != 0) {
+    if (ace_lm_generate(ctx, reqs.data(), lm_batch_size, out.data(), dump_logits, dump_tokens, NULL, NULL, mode) != 0) {
         ace_lm_free(ctx);
         store_free(store);
         return 1;
