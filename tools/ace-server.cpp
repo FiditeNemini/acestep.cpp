@@ -1676,11 +1676,7 @@ int main(int argc, char ** argv) {
             g_lm_params.clamp_fp16    = true;
             g_synth_params.clamp_fp16 = true;
 
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
@@ -1688,12 +1684,11 @@ int main(int argc, char ** argv) {
 
     // --models is required
     if (!models_dir) {
-        fprintf(stderr, "[Server] ERROR: --models is required\n");
         usage(argv[0]);
         return 1;
     }
 
-    // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
+    // stderr capture for SSE /logs (must be after arg parsing so the usage prints directly)
     LogCapture log_capture;
 
     // scan models directory (reads GGUF metadata only)
