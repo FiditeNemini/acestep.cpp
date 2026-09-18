@@ -1873,8 +1873,12 @@ int main(int argc, char ** argv) {
             have_understand ? " /understand" : "");
     fprintf(stderr, "[Server] Models: %zu LM, %zu Text-Enc, %zu DiT, %zu VAE, %zu Adapter\n", g_registry.lm.size(),
             g_registry.text_enc.size(), g_registry.dit.size(), g_registry.vae.size(), g_registry.adapters.size());
+    // A failed bind must reach the caller: a supervisor that reads only the
+    // exit code would otherwise believe the daemon is up.
+    int exit_code = 0;
     if (!svr.listen(host, port)) {
         fprintf(stderr, "[Server] FATAL: cannot bind %s:%d\n", host, port);
+        exit_code = 1;
     }
 
     // stop worker thread (finishes current job, discards pending)
@@ -1890,5 +1894,5 @@ int main(int argc, char ** argv) {
     store_free(g_store);
     fprintf(stderr, "[Server] Done\n");
 
-    return 0;
+    return exit_code;
 }
